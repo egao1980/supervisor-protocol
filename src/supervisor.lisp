@@ -210,6 +210,9 @@ attempt. → (values gen handle) of the new launch, or NIL when none happened."
                 (when stale
                   ;; Abandoned while relaunching: the new launch must not linger.
                   (handler-case (executor-stop exec unit handle :force t) (error () nil))
+                  ;; ... and is released (a confined launch's private directory too).
+                  (handler-case (executor-wait exec unit handle :timeout 5) (error () nil))
+                  (handler-case (executor-release exec unit handle) (error () nil))
                   (return nil))
                 (%executor-started exec unit handle)
                 (unwind-protect (write-unit-file unit)
@@ -659,6 +662,9 @@ SCOPE-CLOSED. Shut-down supervisor → SUPERVISOR-CLOSED."
                         (slot-value unit 'handle) handle)
                   (%executor-started exec unit handle)
                   (%send-stop unit t)
+                  ;; No waiter runs for it: release it here (as RESTART-UNIT does).
+                  (handler-case (executor-wait exec unit handle :timeout 5) (error () nil))
+                  (handler-case (executor-release exec unit handle) (error () nil))
                   (roll-back)
                   (if (eq refused :supervisor)
                       (error 'supervisor-closed :supervisor sup)
