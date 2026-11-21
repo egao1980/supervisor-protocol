@@ -100,9 +100,10 @@
 ;;; sink calls the supervisor's LOG-ERROR-HANDLER (if any) with it, inside the
 ;;; same RESTART-CASE; when that returns too: DROP-TO-MEMORY-ONLY. Every
 ;;; outcome publishes one :LOG-ERROR event (sinks with a unit). The unit is
-;;; never stopped unless ABORT-UNIT is chosen.
+;;; never stopped unless ABORT-UNIT is chosen. Like STOP-TIMEOUT it is a
+;;; signalled condition, not an ERROR: handlers on ERROR never see it.
 
-(define-condition log-write-error (supervisor-error)
+(define-condition log-write-error (supervisor-condition)
   ((sink :initarg :sink :initform nil :reader log-write-error-sink)
    (unit :initarg :unit :initform nil :reader log-write-error-unit)
    (path :initarg :path :initform nil :reader log-write-error-path)
