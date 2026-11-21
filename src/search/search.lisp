@@ -39,6 +39,14 @@
 
 (defparameter +boosted-kinds+ '(:error :stack-trace :test-failure))
 
+(defparameter +severity-order+ '(:test-failure :stack-trace :error :warning :exit)
+  "Kinds-only order, most severe first (see the header).")
+
+(defun %severity (hit-kinds kinds)
+  "The rank in +SEVERITY-ORDER+ of the most severe of HIT-KINDS that is in KINDS."
+  (or (position-if (lambda (k) (and (member k hit-kinds) (member k kinds))) +severity-order+)
+      (length +severity-order+)))
+
 (defun %glob-match-p (pattern string)
   "PATTERN (* any run, ? one character) matches the whole STRING."
   (let ((np (length pattern)) (ns (length string)))
@@ -160,12 +168,14 @@ CLAUSES (%QUERY-CLAUSES); TERMS score it."
                                  :kinds '(:exit) :score nil :stream nil :time (%is-end-time end)
                                  :text "[end of output]")
                   hits)))))
-    ;; Newest first within a log; logs by key (the golden corpus tests fix this
-    ;; order: their logs are written milliseconds apart).
-    (sort hits (lambda (x y)
-                 (cond ((string/= (hit-key x) (hit-key y)) (string< (hit-key x) (hit-key y)))
-                       ((/= (hit-time x) (hit-time y)) (> (hit-time x) (hit-time y)))
-                       (t (> (hit-line x) (hit-line y))))))))
+    ;; Severity, then newest first (see the header).
+    (flet ((severity (h) (%severity (hit-kinds h) kinds)))
+      (sort hits (lambda (x y)
+                   (let ((sx (severity x)) (sy (severity y)))
+                     (cond ((/= sx sy) (< sx sy))
+                           ((/= (hit-time x) (hit-time y)) (> (hit-time x) (hit-time y)))
+                           ((string/= (hit-key x) (hit-key y)) (string< (hit-key x) (hit-key y)))
+                           (t (> (hit-line x) (hit-line y))))))))))
 
 (defun search-logs (index query &key units since until (streams '(:stdout :stderr))
                                      kinds (k +default-search-k+))
