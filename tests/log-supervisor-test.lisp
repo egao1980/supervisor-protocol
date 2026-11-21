@@ -10,12 +10,13 @@
        ,@body)))
 
 (deftest log-default-sinks-and-settings
-  (with-logged-supervisor (sup dir :log-segment-size 4096 :log-segments 3)
+  (with-logged-supervisor (sup dir :log-segment-size 4096 :log-segments 3 :log-max-record 1024)
     (ok (supervisor-log-p sup))
     (ok (= 4096 (supervisor-log-segment-size sup)))
     (ok (= 3 (supervisor-log-segments sup)))
     (ok (= +default-log-total-cap+ (supervisor-log-total-cap sup)))
-    (ok (= +default-log-max-record+ (supervisor-log-max-record sup)))
+    (ok (= 1024 (supervisor-log-max-record sup)))
+    (ok (= 1024 (log-sink-max-record (unit-output-sink (start-unit sup :subagent :function (lambda (u) (declare (ignore u)) :ok))))))
     (let ((a (start-unit sup :subagent :function (lambda (u) (declare (ignore u)) :ok)))
           (b (start-unit sup :subagent :function (lambda (u) (declare (ignore u)) :ok)
                                        :log-segment-size 8192 :log-segments 2))
@@ -51,7 +52,7 @@
         (ok (equal '("out-1" "out-2") (joined-lines records :stdout)))
         (ok (equal '("err-1") (joined-lines records :stderr)))
         (ok (equal '("out-1" "err-1" "out-2") (texts records)) "arrival order"))
-      (ok (log-closed-p u) "finished → end record")
+      (ok (wait-until (lambda () (log-closed-p u))) "finished → end record (written right after the final state)")
       (ok (search "err-1" (unit-output u)) "the memory view is fed from the same pump")
       (ok (equal (list (unit-log-dir sup u))
                  (mapcar #'unit-log-directory (find-unit-logs dir :unit-id (unit-id u))))))))
@@ -109,7 +110,7 @@
         (ok (equal '("hello world" "partial" "no-newline-at-end") (texts records)))
         (ok (equal '(:stdout :stderr :stdout) (mapcar #'log-record-stream records)))
         (ok (equal '(nil t t) (mapcar #'log-record-continued-p records)))
-        (ok (log-closed-p u))
+        (ok (wait-until (lambda () (log-closed-p u))))
         (ok (< (log-record-line (car (last records))) (log-last-line u)) "end record after the flush"))
       (ok (search "no-newline-at-end" (unit-output u))))))
 
@@ -209,7 +210,7 @@
       (let ((logs (find-unit-logs dir :supervisor-id sid)))
         (ok (= 2 (length logs)) "shutdown keeps the logs")
         (ok (equal '("from-a") (texts (log-read (first logs)))))
-        (ok (every #'log-closed-p logs))))))
+        (ok (wait-until (lambda () (every #'log-closed-p logs))))))))
 
 (deftest log-follow-a-live-process-unit
   (with-logged-supervisor (sup dir)
@@ -222,4 +223,4 @@
           (ok (< secs 15))
           (ok (not (fourth result)) "not ended while running")))
       (stop-unit srv :grace 1)
-      (ok (log-closed-p srv)))))
+      (ok (wait-until (lambda () (log-closed-p srv)))))))

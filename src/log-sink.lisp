@@ -21,7 +21,9 @@
 ;;; valid UTF-8 there). Lines are numbered in arrival order across both streams.
 ;;; Every call ends with FINISH-OUTPUT on the segment, so readers in this and
 ;;; other images see the records at once, and a SIGKILL loses at most a torn
-;;; last line. The sink is a HEAD-TAIL-BUFFER too: the same bytes, decoded,
+;;; last line. Everything a unit wrote is in its records before its final state
+;;; is published (pumps joined, thread streams flushed); the :END record follows
+;;; from SINK-CLOSE in the finish path. The sink is a HEAD-TAIL-BUFFER too: the same bytes, decoded,
 ;;; feed the in-memory head + tail (SINK-TEXT, UNIT-OUTPUT, SINK-STATS count
 ;;; characters as in 0.1.0).
 ;;;

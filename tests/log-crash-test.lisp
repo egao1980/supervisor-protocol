@@ -7,7 +7,7 @@
 
 (defun chatty-child-form (state-dir)
   (sp-form
-   (format nil "(let* ((ready nil) (sup (sp:make-supervisor :state-directory ~A :exit-hook nil :log-segment-size 16384 :log-segments 1000)) (u (sp:start-unit sup :subagent :function (lambda (u) (declare (ignore u)) (loop for i from 1 do (format t \"n-~~D~~%\" i) (finish-output) (when (= i 2000) (setf ready t)) (sleep 0.0005)))))) (loop repeat 6000 until ready do (sleep 0.01)) (format t \"READY ~~S ~~S~~%\" (sp:supervisor-id sup) (sp:unit-id u)) (finish-output) (sleep 300))"
+   (format nil "(let* ((ready nil) (sup (sp:make-supervisor :state-directory ~A :exit-hook nil :log-segment-size 16384 :log-segments 1000 :log-max-record 1024)) (u (sp:start-unit sup :subagent :function (lambda (u) (declare (ignore u)) (loop for i from 1 do (format t \"n-~~D~~%\" i) (finish-output) (when (= i 2000) (setf ready t)) (sleep 0.0005)))))) (loop repeat 6000 until ready do (sleep 0.01)) (format t \"READY ~~S ~~S~~%\" (sp:supervisor-id sup) (sp:unit-id u)) (finish-output) (sleep 300))"
            (lit (namestring state-dir)))))
 
 (deftest log-segments-survive-a-killed-supervisor
@@ -51,11 +51,11 @@
                      ;; only its own logs.
                      (let ((before (files-bytes (segment-files (unit-log-directory log)))))
                        (with-supervisor (sup :state-directory dir :log-total-cap 20000
-                                             :log-segment-size 4096 :log-segments 50)
+                                             :log-segment-size 4096 :log-segments 50 :log-max-record 512)
                          (let ((u (start-unit sup :subagent
                                               :function (writer-body (numbered-lines "new-" 500 :pad 40)))))
                            (ok (eq :exited (wait-unit u :timeout 20)))
-                           (ok (<= (supervisor-log-usage sup) 20000))
+                           (ok (wait-until (lambda () (<= (supervisor-log-usage sup) 20000))))
                            (ok (= 2 (length (find-unit-logs dir))))
                            (ok (= before (files-bytes (segment-files (unit-log-directory log))))
                                "the old supervisor's log is untouched")))))))))
