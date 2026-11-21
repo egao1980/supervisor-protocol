@@ -10,7 +10,9 @@ crash-safe) with a per-segment offset index and a per-supervisor total cap, read
 tail and follow across rotations, also after a crash. H8c (0.3.0): `supervisor-protocol/search`, an
 incremental BM25 index over those logs (a tokenizer for code and log text, structured hits for
 errors, warnings, stack traces, test failures and exits, per-segment index files that go with
-their segments), plus `restart-unit` and `close-unit-input`. Brief:
+their segments), plus `restart-unit` and `close-unit-input`. 0.3.1: a pump read that fills its buffer
+mid-line no longer splits the line into two records, so line numbers (and refs) depend on the
+bytes a program printed, not on read timing. Brief:
 [cl-stack/docs/capabilities/supervisor.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/supervisor.md).
 
 ## License
