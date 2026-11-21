@@ -84,7 +84,7 @@
     (let* ((sub (fixture-sub f))
            (job2-pid (unit-pid (fixture-job2 f)))
            (stopped (close-scope sub :grace 2)))
-      (ok (equal '("subagent-1" "shell-job-2") (sort (ids stopped) #'string<)) "→ the units it stopped")
+      (ok (equal '("shell-job-2" "subagent-1") (sort (ids stopped) #'string<)) "→ the units it stopped")
       (ok (eq :killed (unit-state (fixture-agent f))))
       (ok (eq :killed (unit-state (fixture-job2 f))))
       (ok (all-dead-p (list job2-pid)))
