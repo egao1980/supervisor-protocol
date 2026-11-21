@@ -10,9 +10,10 @@
 ;;; never stays :RUNNING after the work ended (no caller needs to poll).
 ;;;
 ;;; H8b: the process executor launches with :ELEMENT-TYPE :OCTETS (all three
-;;; pipes), its pumps hand each chunk to SINK-WRITE-OCTETS unchanged (no
-;;; decoding: binary output reaches the sink byte for byte; a chunk is what one
-;;; read returned, at most +PUMP-CHUNK+ octets), and EXECUTOR-SEND-INPUT writes
+;;; pipes), its pumps hand the bytes to SINK-WRITE-OCTETS unchanged (no
+;;; decoding: binary output reaches the sink byte for byte; a call gets what one
+;;; read returned, cut back to its last LF when the buffer filled while more was
+;;; waiting, see %PUMP), and EXECUTOR-SEND-INPUT writes
 ;;; TEXT encoded as UTF-8. The thread executor binds *STANDARD-OUTPUT* and
 ;;; *ERROR-OUTPUT* to SINK-OUTPUT-STREAMs of the unit's sink (:STDOUT / :STDERR)
 ;;; around the body and flushes them however the body ends. A LOG-WRITE-ERROR
@@ -139,36 +140,60 @@ differs from a forced one). Unknown → NIL.")
    (released :initform nil)
    (input-closed :initform nil :documentation "H8c: EXECUTOR-CLOSE-INPUT ran on this launch.")))
 
-(defparameter +pump-chunk+ 4096)
+(defparameter +pump-chunk+ 16384
+  "The pump buffer, in octets. A line (LF included) that fits in it reaches the sink
+in one SINK-WRITE-OCTETS call unless the program paused in the middle of it.")
 
-(defun %read-chunk (stream buf)
-  "Block for one octet, then take what is available without blocking (at most
-+PUMP-CHUNK+). → the count, or NIL at EOF."
-  (declare (type (simple-array (unsigned-byte 8) (*)) buf))
-  (let ((b (read-byte stream nil :eof)))
+(defun %read-chunk (stream buf start)
+  "Block for one octet, then take what is available without blocking, into BUF from
+START up to its end. → (values end more-p), END the fill, or NIL at EOF. MORE-P:
+BUF filled up while more octets were still waiting."
+  (declare (type (simple-array (unsigned-byte 8) (*)) buf) (type fixnum start))
+  (let ((b (read-byte stream nil :eof))
+        (size (length buf)))
     (if (eq b :eof)
         nil
-        (let ((n 1))
+        (let ((n (1+ start)))
           (declare (type fixnum n))
-          (setf (aref buf 0) b)
-          (loop while (and (< n +pump-chunk+) (listen stream))
+          (setf (aref buf start) b)
+          (loop while (and (< n size) (listen stream))
                 do (let ((b2 (read-byte stream nil :eof)))
                      (when (eq b2 :eof) (return))
                      (setf (aref buf n) b2)
                      (incf n)))
-          n))))
+          (values n (and (= n size) (listen stream) t))))))
 
-(defun %pump (stream sink which)
-  "Copy STREAM (octets) into SINK (as WHICH) until EOF. Each chunk is handed to
-SINK-WRITE-OCTETS as it arrives, unchanged."
-  (let ((buf (make-array +pump-chunk+ :element-type '(unsigned-byte 8))))
-    (loop
-      ;; The pipe went away (closed under us): the pump ends.
-      (let ((n (handler-case (%read-chunk stream buf) (error () nil))))
-        (unless n (return))
-        ;; A broken custom sink must not take the pump into the debugger.
-        (handler-case (sink-write-octets sink which buf :end n)
-          (error () (return)))))))
+(defun %pump (stream sink which &key (chunk +pump-chunk+))
+  "Copy STREAM (octets) into SINK (as WHICH) until EOF, by SINK-WRITE-OCTETS, the
+bytes unchanged. What was available is handed on at once (so a prompt without an
+LF is visible), except when the buffer (CHUNK octets) filled up while more was
+waiting: then the octets after its last LF are kept and completed by the next
+read. A read size limit therefore never splits a line into two records, and the
+line numbers of a program's output depend on its bytes, not on read timing
+(supervisor-protocol#5). A full buffer without an LF is handed on whole."
+  (let ((buf (make-array chunk :element-type '(unsigned-byte 8)))
+        (fill 0))
+    (declare (type fixnum fill))
+    (flet ((hand-on (end)
+             ;; A broken custom sink must not take the pump into the debugger.
+             (handler-case (progn (sink-write-octets sink which buf :end end) t)
+               (error () nil))))
+      (loop
+        ;; The pipe went away (closed under us): the pump ends.
+        (multiple-value-bind (end more-p)
+            (handler-case (%read-chunk stream buf fill) (error () nil))
+          (unless end
+            (when (plusp fill) (hand-on fill))
+            (return))
+          (let ((lf (and more-p (position 10 buf :end end :from-end t))))
+            (cond (lf
+                   (unless (hand-on (1+ lf)) (return))
+                   (replace buf buf :start2 (1+ lf) :end2 end)
+                   (setf fill (- end (1+ lf))))
+                  (t
+                   (unless (hand-on end) (return))
+                   (setf fill 0)))))))))
+
 
 (defun %start-pump (handle stream sink which unit)
   (with-slots (lock cv pumps-left pumps) handle

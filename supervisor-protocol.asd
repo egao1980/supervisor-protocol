@@ -1,5 +1,5 @@
 (defsystem "supervisor-protocol"
-  :version "0.3.0"
+  :version "0.3.1"
   :description "Process supervisor for the cl-stack harness: units, scopes, caps, restarts, events, orphan sweep, rotated capped unit logs, manual restart and stdin close"
   :author "egao1980"
   :license "MIT"
@@ -28,11 +28,11 @@
   :in-order-to ((test-op (test-op "supervisor-protocol/tests"))))
 
 (defsystem "supervisor-protocol/search"
-  :version "0.3.0"
+  :version "0.3.1"
   :description "H8c: incremental BM25 index and structured hits (errors, warnings, stack traces, test failures, exits) over supervisor unit logs"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "supervisor-protocol" "0.3.0")
+  :depends-on ((:version "supervisor-protocol" "0.3.1")
                (:version "cl-stack-pathlib" "0.9.0")
                (:version "encoding-protocol" "0.2.0")
                "bordeaux-threads"
@@ -73,6 +73,7 @@
                (:file "log-supervisor-test")
                (:file "log-error-test")
                (:file "log-crash-test")
+               (:file "pump-test")
                ;; H8c
                (:module "fixtures"
                 :components ((:module "corpus"
