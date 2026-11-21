@@ -22,7 +22,7 @@
   "Prints model|kept|EXTRA|gone|TMPDIR|cwd. (uiop-free-cwd is defined by +cwd-defun+.)")
 
 (defparameter +cwd-defun+
-  "(defun uiop-free-cwd () (namestring (truename \".\")))")
+  "(defun uiop-free-cwd () (sb-ext:native-namestring (truename \".\")))")
 
 (defun report-argv (&key (exit 0))
   (lisp-argv +cwd-defun+ +report-form+ (format nil "(sb-ext:exit :code ~D :abort t)" exit)))
