@@ -1,0 +1,14 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # macOS, Linux and Windows (the canned default). Per-OS cases skip with a note:
+  # the ps inspector and POSIX signal cases off Windows, the CIM inspector on it.
+  test:
+    uses: egao1980/cl-repository/.github/workflows/test-system.yml@main
