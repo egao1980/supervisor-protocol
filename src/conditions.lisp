@@ -75,6 +75,12 @@
              (let ((u (unit-error-unit c)))
                (format s "Unit ~A is not running (state ~S)" (unit-id u) (unit-state u))))))
 
+(define-condition unit-input-closed (unit-error)
+  ()
+  (:documentation "H8c: SEND-UNIT-INPUT after CLOSE-UNIT-INPUT on the unit's current run.")
+  (:report (lambda (c s)
+             (format s "Unit ~A: its stdin was closed" (unit-id (unit-error-unit c))))))
+
 (define-condition executor-unsupported (supervisor-error)
   ((executor :initarg :executor :reader executor-unsupported-executor)
    (operation :initarg :operation :reader executor-unsupported-operation))

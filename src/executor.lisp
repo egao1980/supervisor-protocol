@@ -74,6 +74,19 @@ thread's return value."))
   (:documentation "Write TEXT to the unit's stdin and flush. → T. Not supported →
 EXECUTOR-UNSUPPORTED."))
 
+(defgeneric executor-close-input (executor unit handle)
+  (:documentation "H8c: close the unit's stdin, so a program reading it sees end of
+file. → T when this call closed it, NIL when it was already closed. Not supported
+→ EXECUTOR-UNSUPPORTED (the default method; the thread executor has no stdin)."))
+
+(defmethod executor-close-input ((executor executor) unit handle)
+  (declare (ignore unit handle))
+  (error 'executor-unsupported :executor executor :operation :close-input))
+
+(defmethod executor-close-input ((executor process-executor) unit handle)
+  (declare (ignore unit handle))
+  (%h8c-pending "executor-close-input (process executor)"))
+
 (defgeneric executor-release (executor unit handle)
   (:documentation "After the end: kill what is left of the tree, close the pipes, join the
 pump threads, close nothing that belongs to the sink. → NIL.")

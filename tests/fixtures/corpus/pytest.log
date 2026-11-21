@@ -1,0 +1,46 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.13, pytest-9.2.0, pluggy-1.7.0 -- /home/dev/.cache/uv/builds-v0/.tmpI7uNL3/bin/python
+rootdir: /home/dev/inventory
+collecting ... collected 5 items
+
+tests/test_inventory.py::test_add_new_item PASSED                        [ 20%]
+tests/test_inventory.py::test_add_existing_item PASSED                   [ 40%]
+tests/test_inventory.py::test_total_counts_all_items FAILED              [ 60%]
+tests/test_inventory.py::test_remove_missing_item_raises FAILED          [ 80%]
+tests/test_inventory.py::test_remove_reduces_quantity PASSED             [100%]
+
+=================================== FAILURES ===================================
+_________________________ test_total_counts_all_items __________________________
+
+    def test_total_counts_all_items():
+        inv = Inventory()
+        inv.add("apple", 3)
+        inv.add("pear", 4)
+>       assert inv.total() == 7
+E       assert 8 == 7
+E        +  where 8 = total()
+E        +    where total = <inventory.Inventory object at 0x106de66f0>.total
+
+tests/test_inventory.py:19: AssertionError
+_______________________ test_remove_missing_item_raises ________________________
+
+    def test_remove_missing_item_raises():
+        inv = Inventory()
+        with pytest.raises(ValueError):
+>           inv.remove("kiwi", 1)
+
+tests/test_inventory.py:24: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <inventory.Inventory object at 0x106de7b00>, name = 'kiwi', qty = 1
+
+    def remove(self, name, qty):
+>       if self.items[name] < qty:
+           ^^^^^^^^^^^^^^^^
+E       KeyError: 'kiwi'
+
+inventory.py:9: KeyError
+=========================== short test summary info ============================
+FAILED tests/test_inventory.py::test_total_counts_all_items - assert 8 == 7
+FAILED tests/test_inventory.py::test_remove_missing_item_raises - KeyError: '...
+========================= 2 failed, 3 passed in 0.01s ==========================

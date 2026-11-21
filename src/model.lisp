@@ -1,5 +1,8 @@
 (in-package #:supervisor-protocol)
 
+(defun %h8c-pending (what)
+  (error "supervisor-protocol H8c: ~A is not implemented yet" what))
+
 ;;; ------------------------------------------------------------------
 ;;; Constants
 
