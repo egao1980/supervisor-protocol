@@ -5,7 +5,12 @@
 ;;; Candidate lines: output records of the selected logs and STREAMS, wall time
 ;;; within [SINCE, UNTIL], with at least one of KINDS (when given), containing
 ;;; every phrase (case-insensitive substring of the STRIP-ANSI text), and, when
-;;; the query has terms, containing at least one of them.
+;;; the query has terms, containing at least one of its clause terms. A clause
+;;; term is the first term TOKENIZE emits for a span of the query: the whole
+;;; compound for a compound span ("zzzz-not-there"), else the word. So a line
+;;; must contain some query compound whole; a compound's parts ("not") only add
+;;; to the score of a line that already matched, they do not make it a
+;;; candidate. Every term (clause terms and parts) scores.
 ;;;
 ;;; With terms: documents are blocks (key, ⌊(line − 1) / BLOCK-LINES⌋). For each
 ;;; block with a candidate line, score =
@@ -21,7 +26,13 @@
 ;;; key (STRING<), then line ascending.
 ;;;
 ;;; Without terms (KINDS only): every candidate line is a hit, score NIL. Order:
-;;; hit time descending, then key, then line descending (newest first).
+;;; severity first, then hit time descending, then key (STRING<), then line
+;;; descending (newest first within a severity). A hit's severity is its most
+;;; severe kind among KINDS, in the order :TEST-FAILURE, :STACK-TRACE, :ERROR,
+;;; :WARNING, :EXIT: a failed test names what is broken; a stack trace locates
+;;; a fault; a bare error line reports one; a warning is not a failure; an end
+;;; record is lifecycle, not a problem. The order only matters when KINDS has
+;;; more than one kind; within one kind the result is newest first.
 ;;;
 ;;; :EXIT selects each log's end record (it has no terms, so only a query without
 ;;; terms finds it): text "[end of output]", stream NIL.

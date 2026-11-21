@@ -151,6 +151,15 @@
     (ok (null (ss:search-logs index "\"identifier undeclared\"")) "words in another order")
     (ok (equal (list (corpus-ref index "pytest" 40)) (top-refs index "\"KeyError: 'kiwi'\"")))))
 
+(deftest compound-clause-matching
+  ;; A candidate has a clause term of the query: per span, the whole compound
+  ;; for a compound, else the word. Parts of a query compound only score.
+  (with-tiny-index (index '(("a" "not here") ("b" "see zzzz-not-there now")))
+    (ok (equal '("b") (mapcar #'ss:hit-key (ss:search-logs index "zzzz-not-there")))
+        "the compound must occur whole: \"not here\" is not a candidate")
+    (ok (equal '("a" "b") (sort (mapcar #'ss:hit-key (ss:search-logs index "not")) #'string<))
+        "a plain word matches a compound's part in the text")))
+
 (deftest search-argument-errors
   (with-corpus-index (index root :names '("build"))
     (ok (signals (ss:search-logs index "") 'ss:search-error) "no terms, no kinds")

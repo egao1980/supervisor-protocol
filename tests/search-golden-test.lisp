@@ -10,7 +10,6 @@
      ("build" 19 "undeclared identifier tokn" 1 nil)
      ("build" 19 "parser.c error" 3 nil)
      ("build" 46 "unused variable" 3 nil)
-     ("build" 19 "" 3 '(:error))
      ;; rove.log: two failures, a TYPE-ERROR, an SBCL backtrace
      ("rove" 29 "currency" 1 '(:test-failure))
      ("rove" 20 "ADD-FLOATS 0.3" 3 '(:test-failure))
@@ -46,6 +45,24 @@
       (ok (equal (list (cons (line-of-fixture index "devserver" 7) (line-of-fixture index "devserver" 12)))
                  (mapcar #'ss:hit-extent (remove (corpus-ref index "devserver" 7) hits
                                                  :key #'ss:hit-ref :test-not #'equal)))))))
+
+;;; Kinds-only order: severity (:TEST-FAILURE, :STACK-TRACE, :ERROR, :WARNING,
+;;; :EXIT), then time descending, then key, then line descending. The corpus
+;;; logs are written milliseconds apart, so these assert only what the rule
+;;; fixes whatever the clock says: severity groups, and newest first in a log.
+
+(deftest golden-kinds-only-order
+  (with-corpus-index (index root)
+    (ok (in-top-p (corpus-ref index "build" 19) index "" :units '("build") :kinds '(:error) :k 3)
+        "build:19 is one of the build log's three error lines")
+    (ok (equal (mapcar (lambda (n) (corpus-ref index "build" n)) '(27 26 19 49 46))
+               (top-refs index "" :units '("build") :kinds '(:error :warning) :k 10))
+        "errors before warnings, though warnings 46 and 49 are newer than error 19; newest first in each")
+    (let* ((hits (ss:search-logs index "" :kinds '(:test-failure :error) :k 50))
+           (failures (count-if (lambda (h) (member :test-failure (ss:hit-kinds h))) hits)))
+      (ok (= 6 failures) "rove 20, 29; pytest 8, 9, 44, 45 (45 is an :error too)")
+      (ok (every (lambda (h) (member :test-failure (ss:hit-kinds h))) (subseq hits 0 failures))
+          "every test failure before any hit that is only an error"))))
 
 (deftest golden-errors-across-the-corpus
   (with-corpus-index (index root)
