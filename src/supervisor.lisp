@@ -449,6 +449,8 @@ START-UNIT / MAKE-SCOPE → SUPERVISOR-CLOSED; queries still answer. Idempotent.
           (setf (slot-value s 'closed-p) t)))
       (dolist (u units)
         (unless (slot-value u 'abandoned-p) (%delete-unit-file u))))
+    ;; Logs stay; deletes a Windows reader held up are retried once more.
+    (ignore-errors (%retry-supervisor-log-deletes supervisor))
     (%stop-dispatcher supervisor)
     (let ((hook (supervisor-exit-hook supervisor)))
       (when hook (%remove-exit-hook hook))))
@@ -737,6 +739,48 @@ is NIL). LABELS: a plist; each pair must be in UNIT-LABELS (EQUAL values)."
 
 ;;; ------------------------------------------------------------------
 ;;; H8b: the supervisor's log accounting
+;;;
+;;; Every log sink with a unit registers a %LOG-ENTRY (src/log-sink.lisp) with
+;;; the unit's supervisor; entries stay when the unit leaves the registry (only
+;;; DELETE-UNIT-LOG removes one). Usage is the size of the segment and index
+;;; files in the entries' directories. The cap is enforced on the thread that
+;;; rotated or closed a log, after its sink lock is released; one enforcer at a
+;;; time (a trigger that finds one running leaves a flag it picks up).
+
+(defun %register-log (supervisor sink)
+  (let ((entry (make-%log-entry :supervisor supervisor :directory (log-sink-directory sink)
+                                :sink sink)))
+    (setf (slot-value sink 'entry) entry)
+    (bt2:with-lock-held ((slot-value supervisor 'log-lock))
+      (setf (slot-value supervisor 'log-entries)
+            (append (slot-value supervisor 'log-entries) (list entry))))
+    entry))
+
+(defun %log-entries (supervisor)
+  (bt2:with-lock-held ((slot-value supervisor 'log-lock))
+    (copy-list (slot-value supervisor 'log-entries))))
+
+(defun %log-sink-finished (sink)
+  "SINK-CLOSE ran (no lock held): the unit finished, its log may give segments up."
+  (let ((entry (slot-value sink 'entry)))
+    (when entry
+      (let ((sup (%le-supervisor entry)))
+        (bt2:with-lock-held ((slot-value sup 'log-lock))
+          (unless (%le-finished entry)
+            (setf (%le-finished entry) (incf (slot-value sup 'log-tick))
+                  (%le-sink entry) nil))))
+      (%log-cap-changed sink))))
+
+(defun %log-directory-bytes (directory)
+  (loop for p in (and (uiop:directory-exists-p directory)
+                      (handler-case (pathlib:fs-iterdir pathlib:*filesystem* directory)
+                        (error () nil)))
+        when (member (pathname-type p) '("seg" "idx") :test #'equal)
+          sum (or (ignore-errors (pathlib:fs-file-size pathlib:*filesystem* p)) 0)))
+
+(defun %log-usage (entries)
+  (loop for dir in (remove-duplicates (mapcar #'%le-directory entries) :test #'equal)
+        sum (%log-directory-bytes dir)))
 
 (defun supervisor-log-usage (supervisor)
   "Bytes of segment and index files of every unit log this supervisor wrote (units
@@ -745,5 +789,216 @@ count until they are gone). The total cap (SUPERVISOR-LOG-TOTAL-CAP) evicts, aft
 each rotation and each finished unit, while this is over it: first the segments of
 the finished unit that finished earliest (oldest segment first; its newest becomes
 a stub), then the oldest segment of a live unit that is not that unit's newest."
-  (declare (ignore supervisor))
-  (%h8b-pending "supervisor-log-usage"))
+  (%log-usage (%log-entries supervisor)))
+
+(defun %delete-path-or-defer (supervisor path)
+  (ignore-errors (pathlib:fs-unlink pathlib:*filesystem* path :missing-ok t))
+  (when (probe-file path)
+    (bt2:with-lock-held ((slot-value supervisor 'log-lock))
+      (pushnew path (slot-value supervisor 'log-deferred) :test #'equal))))
+
+(defun %retry-log-deferred (supervisor)
+  (let ((paths (bt2:with-lock-held ((slot-value supervisor 'log-lock))
+                 (shiftf (slot-value supervisor 'log-deferred) '()))))
+    (dolist (p paths) (%delete-path-or-defer supervisor p))))
+
+;;; Stubs. A finished unit gives up its oldest output segment J; its newest
+;;; segment is then a stub: three records (header, a :TOTAL-CAP drop marker for
+;;; J, end), numbered after the output segments, its lines following the last
+;;; line of the log, written atomically, rewritten in place by each later step.
+;;; The header's cumulative fields cover everything dropped before J and the
+;;; marker covers J, so readers' gap counts stay exact; the end record keeps
+;;; LOG-CLOSED-P. The stub is written before J is deleted.
+
+(defun %stub-segment-p (seg)
+  "A closed newest segment without output records (a stub, or an empty log's)."
+  (and (%segment-closed-p seg)
+       (notany (lambda (r) (eq :output (log-record-type r))) (%rs-records seg))))
+
+(defun %segment-output-bytes (seg)
+  (loop for r across (%rs-records seg)
+        when (eq :output (log-record-type r))
+          sum (+ (length (log-record-octets r)) (if (log-record-continued-p r) 0 1))))
+
+(defun %dropped-through (segs)
+  (reduce #'max (loop for s in segs
+                      append (cons (or (getf (%rs-header s) :dropped-through) 0)
+                                   (mapcar (lambda (d) (or (getf d :segment) 0)) (%drops-in s))))
+          :initial-value 0))
+
+(defun %stub-octets (line header drop end stride)
+  "→ (values segment-octets index-octets) of a stub whose first line is LINE."
+  (let ((seg (%make-obuf 512)) (idx (%make-obuf 32))
+        (wall (%wall-ms)) (mono (%mono-ms)))
+    (%obuf-ascii idx "SPLX")
+    (%obuf-u32 idx stride)
+    (%obuf-u64 idx line)
+    (loop for (type detail) in (list (list :header header) (list :drop drop) (list :end end))
+          for l from line
+          do (when (zerop (mod (- l line) stride)) (%obuf-u64 idx (%obuf-fill seg)))
+             (let ((v (%meta-octets detail)))
+               (%write-record seg l wall mono (%type-char type nil) nil v 0 (length v) t)))
+    (values (%obuf-octets seg) (%obuf-octets idx))))
+
+(defun %finished-step (supervisor entry)
+  "Evict the oldest output segment of ENTRY's (finished) log behind a stub. → T when
+the files changed."
+  (let* ((dir (%le-directory entry))
+         (segs (%scan-log dir))
+         (newest (car (last segs)))
+         (stub (and newest (%stub-segment-p newest) newest))
+         (outputs (if stub (butlast segs) segs)))
+    (when (or (null newest) (null outputs) (not (%segment-closed-p newest)))
+      (setf (%le-stub-p entry) t)
+      (return-from %finished-step nil))
+    (let* ((j (first outputs))
+           (following (or (second segs) nil))
+           (end-record (find :end (%rs-records newest) :key #'log-record-type :from-end t))
+           (total (or (getf (log-record-detail end-record) :bytes) 0))
+           (number (if stub (%rs-number stub) (1+ (%rs-number newest))))
+           (line (if stub
+                     (%segment-first-line stub)
+                     (1+ (log-record-line (svref (%rs-records newest)
+                                                 (1- (length (%rs-records newest))))))))
+           (a (or (%segment-first-line j) 1))
+           (b (1- (if (and following (not (eq following j)))
+                      (or (%segment-first-line following) line)
+                      line)))
+           (h (or (%rs-header newest) (%rs-header j)))
+           (stride (or (%index-header-stride (%read-octets (%rs-idx-path j))) +log-index-stride+)))
+      (multiple-value-bind (dr db) (%prefix-drops segs)
+        (multiple-value-bind (seg-octets idx-octets)
+            (%stub-octets line
+                          (list :format +log-format+
+                                :supervisor-id (getf h :supervisor-id) :unit-id (getf h :unit-id)
+                                :kind (getf h :kind) :segment number :first-line line
+                                :dropped-through (%dropped-through segs)
+                                :dropped-records dr :dropped-bytes db)
+                          (list :segment (%rs-number j) :first-line a :last-line b
+                                :records (1+ (- b a)) :bytes (%segment-output-bytes j)
+                                :reason :total-cap)
+                          (list :last-line (+ line 2) :bytes total)
+                          stride)
+          (pathlib:fs-write-atomic pathlib:*filesystem* (%segment-pathname dir number "seg") seg-octets)
+          (pathlib:fs-write-atomic pathlib:*filesystem* (%segment-pathname dir number "idx") idx-octets)
+          (%delete-path-or-defer supervisor (%rs-path j))
+          (%delete-path-or-defer supervisor (%rs-idx-path j))
+          t)))))
+
+(defun %log-grew (sink bytes)
+  "SINK wrote BYTES more to its files. → true when the supervisor's usage may now be
+over its cap (a cap pass is due): the usage of the last pass plus what was
+written since, so the cap also holds while a live unit fills its newest segment."
+  (let* ((entry (slot-value sink 'entry))
+         (sup (and entry (%le-supervisor entry))))
+    (when (and sup (plusp bytes))
+      (bt2:with-lock-held ((slot-value sup 'log-lock))
+        (> (incf (slot-value sup 'log-estimate) bytes)
+           (or (slot-value sup 'log-trigger-at) (supervisor-log-total-cap sup)))))))
+
+(defun %note-log-usage (supervisor usage)
+  "After a cap pass: USAGE is the new base; over the cap (nothing left to evict), the
+next pass waits for some growth."
+  (let ((cap (supervisor-log-total-cap supervisor)))
+    (bt2:with-lock-held ((slot-value supervisor 'log-lock))
+      (setf (slot-value supervisor 'log-estimate) usage
+            (slot-value supervisor 'log-trigger-at)
+            (if (> usage cap) (+ usage (max 4096 (floor cap 64))) cap)))))
+
+(defun %enforce-log-cap (supervisor)
+  (%retry-log-deferred supervisor)
+  (let ((cap (supervisor-log-total-cap supervisor))
+        (busy '()))
+    (loop repeat 100000
+          do (let* ((entries (%log-entries supervisor))
+                    (usage (%log-usage entries)))
+               (%note-log-usage supervisor usage)
+               (when (<= usage cap) (return))
+               (let ((entry
+                       (or
+                        ;; the finished unit that finished earliest
+                        (let ((best nil))
+                          (dolist (e entries best)
+                            (when (and (%le-finished e) (not (%le-stub-p e)) (not (member e busy))
+                                       (or (null best) (< (%le-finished e) (%le-finished best))))
+                              (setf best e))))
+                        ;; a live unit with a segment older than its newest
+                        (find-if (lambda (e)
+                                   (let ((sink (%le-sink e)))
+                                     (and (not (%le-finished e)) sink (not (member e busy))
+                                          (slot-value sink 'retained))))
+                                 entries))))
+                 (unless entry (return))
+                 (unless (handler-case
+                             (if (%le-finished entry)
+                                 (%finished-step supervisor entry)
+                                 (%log-sink-drop-for-cap (%le-sink entry)))
+                           (error () nil))
+                   (push entry busy)))))))
+
+(defun %log-cap-changed (sink)
+  "A rotation or a finished log (no lock held): enforce SINK's supervisor's total cap."
+  (let* ((entry (slot-value sink 'entry))
+         (sup (and entry (%le-supervisor entry))))
+    (when sup
+      (let ((*in-critical* t))
+        (setf (slot-value sup 'log-enforce-pending) t)
+        (loop while (slot-value sup 'log-enforce-pending)
+              do (if (bt2:acquire-lock (slot-value sup 'log-enforcing) :wait nil)
+                     (unwind-protect
+                          (progn (setf (slot-value sup 'log-enforce-pending) nil)
+                                 (handler-case (%enforce-log-cap sup) (error () nil)))
+                       (bt2:release-lock (slot-value sup 'log-enforcing)))
+                     (return)))))))
+
+(defun %find-live-log-sink (directory)
+  "The open LOG-SINK of this image writing into DIRECTORY, or NIL."
+  (dolist (sup (live-supervisors))
+    (dolist (e (%log-entries sup))
+      (let ((sink (%le-sink e)))
+        (when (and sink (equal directory (%le-directory e))
+                   (not (slot-value sink 'log-closed-p)))
+          (return-from %find-live-log-sink sink))))))
+
+(defun %forget-log (directory)
+  "DELETE-UNIT-LOG: no supervisor of this image counts DIRECTORY any more."
+  (dolist (sup (live-supervisors))
+    (bt2:with-lock-held ((slot-value sup 'log-lock))
+      (setf (slot-value sup 'log-entries)
+            (remove directory (slot-value sup 'log-entries) :key #'%le-directory :test #'equal)))))
+
+(defun %retry-supervisor-log-deletes (supervisor)
+  "SHUTDOWN-SUPERVISOR: retry every deferred delete of its logs."
+  (%retry-log-deferred supervisor)
+  (dolist (e (%log-entries supervisor))
+    (let ((sink (%le-sink e)))
+      (when sink (ignore-errors (%log-sink-retry-deferred sink))))))
+
+;;; ABORT-UNIT (a LOG-WRITE-ERROR restart): a forced stop request that does not
+;;; wait, from the writing thread (a pump keeps reading to EOF; a thread unit's
+;;; own thread unwinds once it leaves the sink).
+
+(defun %abort-unit-no-wait (unit)
+  (let ((sup (unit-supervisor unit)) (send nil))
+    (when sup
+      (%with-lock (sup)
+        (when (and (unit-live-p unit) (not (slot-value unit 'abandoned-p)))
+          (setf (slot-value unit 'restart-pending) nil
+                (slot-value unit 'stop-requested-p) t)
+          (when (unit-pid unit) (setf (slot-value unit 'stop-signal) :kill))
+          (setf send t)
+          (%broadcast sup)))
+      (when send
+        (if (slot-value unit 'handle)
+            (%send-stop unit t)
+            ;; Output before START-UNIT recorded the handle: stop once it has.
+            (bt2:make-thread
+             (lambda ()
+               (loop repeat 1000
+                     until (slot-value unit 'handle)
+                     do (sleep 0.01))
+               (when (unit-pid unit)
+                 (%with-lock (sup) (setf (slot-value unit 'stop-signal) :kill)))
+               (%send-stop unit t))
+             :name (format nil "supervisor abort ~A" (unit-id unit))))))
+    nil))

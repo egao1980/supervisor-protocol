@@ -25,7 +25,7 @@
   ((backend :initarg :backend :initform nil :reader process-executor-backend
             :documentation "A PROCESS-PROTOCOL backend, or NIL for PROCESS-PROTOCOL:*PROCESS-BACKEND*."))
   (:documentation "UNIT-COMMAND through PROCESS-PROTOCOL:LAUNCH :PROCESS-GROUP T, stdin,
-stdout and stderr as UTF-8 character pipes, :DIRECTORY UNIT-CWD, :ENV UNIT-ENV.
+stdout and stderr as octet pipes (output pumped to SINK-WRITE-OCTETS, input UTF-8), :DIRECTORY UNIT-CWD, :ENV UNIT-ENV.
 Graceful stop: KILL :TREE T (Unix SIGTERM to the group; Windows the job object,
 always forced). Force: KILL :TREE T :FORCE T. On exit (by itself or not) the
 rest of the tree is killed too (EXECUTOR-RELEASE), so nothing the unit started
@@ -116,24 +116,34 @@ differs from a forced one). Unknown → NIL.")
 
 (defparameter +pump-chunk+ 4096)
 
+(defun %read-chunk (stream buf)
+  "Block for one octet, then take what is available without blocking (at most
++PUMP-CHUNK+). → the count, or NIL at EOF."
+  (declare (type (simple-array (unsigned-byte 8) (*)) buf))
+  (let ((b (read-byte stream nil :eof)))
+    (if (eq b :eof)
+        nil
+        (let ((n 1))
+          (declare (type fixnum n))
+          (setf (aref buf 0) b)
+          (loop while (and (< n +pump-chunk+) (listen stream))
+                do (let ((b2 (read-byte stream nil :eof)))
+                     (when (eq b2 :eof) (return))
+                     (setf (aref buf n) b2)
+                     (incf n)))
+          n))))
+
 (defun %pump (stream sink which)
-  "Copy STREAM into SINK (as WHICH) until EOF. Chunks are written as they arrive."
-  (let ((buf (make-string +pump-chunk+)))
-    (handler-case
-        (loop
-          (let ((c (read-char stream nil :eof)))
-            (when (eq c :eof) (return))
-            (setf (char buf 0) c)
-            (let ((n 1) (eof nil))
-              (loop while (< n +pump-chunk+)
-                    do (let ((c2 (read-char-no-hang stream nil :eof)))
-                         (cond ((null c2) (return))
-                               ((eq c2 :eof) (setf eof t) (return))
-                               (t (setf (char buf n) c2) (incf n)))))
-              (sink-write sink which (subseq buf 0 n))
-              (when eof (return)))))
-      ;; The pipe went away (closed under us, decoding trouble): the pump ends.
-      (error () nil))))
+  "Copy STREAM (octets) into SINK (as WHICH) until EOF. Each chunk is handed to
+SINK-WRITE-OCTETS as it arrives, unchanged."
+  (let ((buf (make-array +pump-chunk+ :element-type '(unsigned-byte 8))))
+    (loop
+      ;; The pipe went away (closed under us): the pump ends.
+      (let ((n (handler-case (%read-chunk stream buf) (error () nil))))
+        (unless n (return))
+        ;; A broken custom sink must not take the pump into the debugger.
+        (handler-case (sink-write-octets sink which buf :end n)
+          (error () (return)))))))
 
 (defun %start-pump (handle stream sink which unit)
   (with-slots (lock cv pumps-left pumps) handle
@@ -147,10 +157,6 @@ differs from a forced one). Unknown → NIL.")
            :name (format nil "supervisor pump ~A ~(~A~)" (unit-id unit) which))
           pumps)))
 
-(defparameter +process-external-format+
-  #+sbcl '(:utf-8 :replacement #\?)
-  #-sbcl :utf-8)
-
 (defmethod executor-launch ((executor process-executor) unit)
   (let* ((command (unit-command unit))
          (backend (process-executor-backend executor))
@@ -159,8 +165,7 @@ differs from a forced one). Unknown → NIL.")
                (apply #'pp:launch command
                       :process-group t
                       :input :stream :output :stream :error-output :stream
-                      :element-type 'character
-                      :external-format +process-external-format+
+                      :element-type :octets
                       (append (and (unit-cwd unit) (list :directory (unit-cwd unit)))
                               (and (unit-env unit) (list :env (unit-env unit)))
                               (and backend (list :backend backend))))
@@ -212,7 +217,7 @@ differs from a forced one). Unknown → NIL.")
       (error 'unit-not-running :supervisor (unit-supervisor unit) :unit unit))
     (handler-case
         (bt2:with-lock-held ((slot-value handle 'lock))
-          (write-string text stdin)
+          (write-sequence (%utf8-encode text) stdin)
           (finish-output stdin))
       (stream-error ()
         (error 'unit-not-running :supervisor (unit-supervisor unit) :unit unit
@@ -257,9 +262,14 @@ differs from a forced one). Unknown → NIL.")
 
 (defun %thread-body (handle unit)
   (with-slots (lock cv go-p done forced condition result in-body deferred) handle
-    (let ((*current-unit* unit)
-          (*current-scope* (unit-owner unit))
-          (*deferred-stop* deferred))
+    (let* ((sink (unit-output-sink unit))
+           (out (and sink (make-sink-output-stream sink :stdout)))
+           (err (and sink (make-sink-output-stream sink :stderr)))
+           (*standard-output* (or out *standard-output*))
+           (*error-output* (or err *error-output*))
+           (*current-unit* unit)
+           (*current-scope* (unit-owner unit))
+           (*deferred-stop* deferred))
       (unwind-protect
            (when (eq :forced
                      (catch handle
@@ -273,6 +283,10 @@ differs from a forced one). Unknown → NIL.")
                        nil))
              (setf forced t))
         (setf in-body nil)
+        ;; Everything the body printed is in the sink before the final state is
+        ;; published (the waiter publishes after DONE).
+        (dolist (s (list out err))
+          (when s (handler-case (finish-output s) (error () nil))))
         (bt2:with-lock-held (lock)
           (setf done t)
           (bt2:condition-broadcast cv))))))

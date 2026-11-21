@@ -1,9 +1,5 @@
 (in-package #:supervisor-protocol)
 
-;;; H8b contract stub. The implementation replaces every call and deletes it.
-(defun %h8b-pending (what)
-  (error "supervisor-protocol H8b: ~A is not implemented yet" what))
-
 ;;; ------------------------------------------------------------------
 ;;; Constants
 
@@ -173,7 +169,16 @@ min(max, initial × factor^(attempt − 1))."
    (dispatcher :initform nil)
    (dispatch-closing :initform nil)
    (dispatch-done :initform nil)
-   (os-start :initform nil :documentation "This image's OS start string (lazy).")))
+   (os-start :initform nil :documentation "This image's OS start string (lazy).")
+   ;; H8b: every log this supervisor wrote (the total cap), guarded by LOG-LOCK
+   (log-lock :initform (bt2:make-lock :name "supervisor logs"))
+   (log-entries :initform '() :documentation "%LOG-ENTRYs in creation order.")
+   (log-tick :initform 0 :documentation "Finish order of logs.")
+   (log-deferred :initform '() :documentation "Paths whose delete failed (Windows).")
+   (log-enforcing :initform (bt2:make-lock :name "supervisor log cap"))
+   (log-enforce-pending :initform nil)
+   (log-estimate :initform 0 :documentation "Usage at the last cap pass + bytes written since.")
+   (log-trigger-at :initform nil :documentation "LOG-ESTIMATE above this runs a cap pass (NIL: the cap).")))
 
 ;;; ------------------------------------------------------------------
 ;;; Scopes
