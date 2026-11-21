@@ -74,6 +74,30 @@ thread's return value."))
   (:documentation "Write TEXT to the unit's stdin and flush. → T. Not supported →
 EXECUTOR-UNSUPPORTED."))
 
+(defgeneric executor-close-input (executor unit handle)
+  (:documentation "H8c: close the unit's stdin, so a program reading it sees end of
+file. → T when this call closed it, NIL when it was already closed. Not supported
+→ EXECUTOR-UNSUPPORTED (the default method; the thread executor has no stdin)."))
+
+(defmethod executor-close-input ((executor executor) unit handle)
+  (declare (ignore unit handle))
+  (error 'executor-unsupported :executor executor :operation :close-input))
+
+(defmethod executor-close-input ((executor process-executor) unit handle)
+  (declare (ignore unit))
+  (let ((stdin (pp:stdin (%ph-process handle))))
+    (bt2:with-lock-held ((slot-value handle 'lock))
+      (if (slot-value handle 'input-closed)
+          nil
+          (progn
+            (setf (slot-value handle 'input-closed) t)
+            ;; The child may be gone already: a broken pipe on the final flush
+            ;; still leaves the stream closed.
+            (when stdin
+              (handler-case (close stdin)
+                (stream-error () (close stdin :abort t))))
+            t)))))
+
 (defgeneric executor-release (executor unit handle)
   (:documentation "After the end: kill what is left of the tree, close the pipes, join the
 pump threads, close nothing that belongs to the sink. → NIL.")
@@ -112,7 +136,8 @@ differs from a forced one). Unknown → NIL.")
    (cv :initform (bt2:make-condition-variable :name "process unit pumps"))
    (pumps-left :initform 0)
    (pumps :initform '())
-   (released :initform nil)))
+   (released :initform nil)
+   (input-closed :initform nil :documentation "H8c: EXECUTOR-CLOSE-INPUT ran on this launch.")))
 
 (defparameter +pump-chunk+ 4096)
 
@@ -215,13 +240,20 @@ SINK-WRITE-OCTETS as it arrives, unchanged."
   (let ((stdin (pp:stdin (%ph-process handle))))
     (unless stdin
       (error 'unit-not-running :supervisor (unit-supervisor unit) :unit unit))
-    (handler-case
-        (bt2:with-lock-held ((slot-value handle 'lock))
-          (write-sequence (%utf8-encode text) stdin)
-          (finish-output stdin))
-      (stream-error ()
-        (error 'unit-not-running :supervisor (unit-supervisor unit) :unit unit
-                                 :message "its stdin is closed")))
+    (let ((closed nil))
+      (handler-case
+          (bt2:with-lock-held ((slot-value handle 'lock))
+            (if (slot-value handle 'input-closed)
+                (setf closed t)
+                (progn
+                  (write-sequence (%utf8-encode text) stdin)
+                  (finish-output stdin))))
+        (stream-error ()
+          (error 'unit-not-running :supervisor (unit-supervisor unit) :unit unit
+                                   :message "its stdin is closed")))
+      ;; Signalled outside the handle lock.
+      (when closed
+        (error 'unit-input-closed :supervisor (unit-supervisor unit) :unit unit)))
     t))
 
 (defparameter +pump-join-timeout+ 3

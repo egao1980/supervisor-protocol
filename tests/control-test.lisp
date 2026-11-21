@@ -1,0 +1,100 @@
+(in-package #:supervisor-protocol/tests)
+
+;;; H8c control additions: CLOSE-UNIT-INPUT and RESTART-UNIT.
+
+(deftest close-unit-input-ends-a-stdin-reader
+  (with-supervisor (sup)
+    (let ((u (start-unit sup :rpc :command (echo-server-argv) :restart :never)))
+      (send-unit-input u (format nil "ping-h8c~%"))
+      (ok (wait-until (lambda () (search "ping-h8c" (unit-output u))) :timeout 20))
+      (ok (eq t (close-unit-input u)))
+      (ok (equal '(:exited 0) (multiple-value-list (wait-unit u :timeout 20)))
+          "the reader saw end of file and exited by itself")
+      (ok (null (close-unit-input u)) "a finished unit: NIL"))))
+
+(deftest send-after-close-unit-input
+  (with-supervisor (sup)
+    (let ((u (start-unit sup :shell-job :command (sleeper-argv 30))))
+      (ok (eq t (close-unit-input u)))
+      (ok (null (close-unit-input u)) "already closed")
+      (ok (signals (send-unit-input u "late") 'unit-input-closed))
+      (ok (eq :running (unit-state u)) "closing stdin does not stop a unit that ignores it")
+      (stop-unit u :grace 1))))
+
+(deftest close-unit-input-thread-unsupported
+  (with-supervisor (sup)
+    (let ((u (start-unit sup :subagent :function (lambda (u) (declare (ignore u)) (sleep 10) :done))))
+      (ok (signals (close-unit-input u) 'executor-unsupported))
+      (stop-unit u :grace 1))))
+
+(deftest restart-unit-live-process
+  (with-supervisor (sup)
+    (let* ((u (start-unit sup :shell-job :command (sleeper-argv 60)))
+           (pid1 (unit-pid u))
+           (seq (supervisor-last-seq sup)))
+      (ok (eq u (restart-unit u :grace 1)))
+      (ok (eq :running (unit-state u)))
+      (ok (and (unit-pid u) (/= pid1 (unit-pid u))) "a new process")
+      (ok (all-dead-p (list pid1)) "the old one is gone")
+      (ok (= 0 (unit-restart-count u)) "manual restarts are not counted")
+      (let ((events (unit-events (events-since sup seq) (unit-id u))))
+        (ok (equal '((:state :running :killed) (:state :killed :starting) (:state :starting :running))
+                   (mapcar (lambda (e) (list (event-type e) (event-from e) (event-to e))) events)))
+        (ok (equal '(:restart :manual) (event-detail (second events)))))
+      (stop-unit u :grace 1))))
+
+(deftest restart-unit-finished-thread-continues-its-log
+  (with-temp-dir (dir)
+    (with-supervisor (sup :state-directory dir)
+      (let* ((runs 0)
+             (gate (list nil))
+             (u (start-unit sup :subagent
+                                :function (lambda (u)
+                                            (declare (ignore u))
+                                            (let ((n (incf runs)))
+                                              (format t "run-~D~%" n)
+                                              (finish-output)
+                                              (when (= n 2)
+                                                (loop until (car gate) do (sleep 0.01)))
+                                              n)))))
+        (wait-unit u :timeout 10)
+        (ok (wait-until (lambda () (log-closed-p u)) :timeout 10))
+        (ok (eq u (restart-unit u)))
+        (ok (wait-until (lambda () (member "run-2" (texts (log-read u)) :test #'equal)) :timeout 10))
+        (ok (not (log-closed-p u)) "an end record followed by a new run does not close the log")
+        (setf (car gate) t)
+        (ok (equal '(:exited nil) (multiple-value-list (wait-unit u :timeout 10))))
+        (ok (eql 2 (unit-result u)))
+        (ok (wait-until (lambda () (log-closed-p u)) :timeout 10))
+        (ok (equal '("run-1" "run-2") (texts (log-read u))) "one log, both runs")
+        (ok (contiguous-p (lines-of (all-records u))) "one line sequence")))))
+
+(deftest restart-unit-errors
+  (with-supervisor (sup :kind-caps '(:subagent 1))
+    (let ((a (start-unit sup :subagent :function (lambda (u) (declare (ignore u)) :a))))
+      (wait-unit a :timeout 10)
+      (start-unit sup :subagent :function (lambda (u) (declare (ignore u)) :b))
+      (ok (null (find-unit sup (unit-id a))) "A was evicted")
+      (ok (signals (restart-unit a) 'supervisor-error) "an evicted unit cannot restart")))
+  (let* ((sup (make-supervisor :exit-hook nil))
+         (u (start-unit sup :subagent :function (lambda (u) (declare (ignore u)) :done))))
+    (wait-unit u :timeout 10)
+    (%quiet-shutdown sup)
+    (ok (signals (restart-unit u) 'supervisor-closed))))
+
+(defclass once-executor (thread-executor)
+  ((launches :initform 0 :accessor launches)))
+
+(defmethod executor-launch :around ((e once-executor) unit)
+  (declare (ignore unit))
+  (if (> (incf (launches e)) 1)
+      (error "no second launch")
+      (call-next-method)))
+
+(deftest restart-unit-launch-failure
+  (with-supervisor (sup)
+    (let ((u (start-unit sup :subagent :executor (make-instance 'once-executor)
+                                       :function (lambda (u) (declare (ignore u)) :done))))
+      (wait-unit u :timeout 10)
+      (ok (signals (restart-unit u) 'unit-start-error))
+      (ok (eq :failed (unit-state u)) "left :FAILED"))))

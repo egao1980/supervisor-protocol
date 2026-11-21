@@ -1,6 +1,6 @@
 (defsystem "supervisor-protocol"
-  :version "0.2.0"
-  :description "Process supervisor for the cl-stack harness: units, scopes, caps, restarts, events, orphan sweep, rotated capped unit logs"
+  :version "0.3.0"
+  :description "Process supervisor for the cl-stack harness: units, scopes, caps, restarts, events, orphan sweep, rotated capped unit logs, manual restart and stdin close"
   :author "egao1980"
   :license "MIT"
   :depends-on ((:version "process-protocol" "0.4.1")
@@ -23,11 +23,32 @@
                (:file "executor")       ; executor GFs: process-protocol and in-image threads
                (:file "events")         ; sequence log, replay, subscriptions
                (:file "unit-file")      ; durable unit files and the orphan sweep
-               (:file "supervisor"))    ; make-supervisor, start/stop/wait, caps, restarts, queries
+               (:file "supervisor")     ; make-supervisor, start/stop/wait, caps, restarts, queries
+               (:file "control"))       ; H8c: restart-unit, close-unit-input
   :in-order-to ((test-op (test-op "supervisor-protocol/tests"))))
 
+(defsystem "supervisor-protocol/search"
+  :version "0.3.0"
+  :description "H8c: incremental BM25 index and structured hits (errors, warnings, stack traces, test failures, exits) over supervisor unit logs"
+  :author "egao1980"
+  :license "MIT"
+  :depends-on ((:version "supervisor-protocol" "0.3.0")
+               (:version "cl-stack-pathlib" "0.9.0")
+               (:version "encoding-protocol" "0.2.0")
+               "bordeaux-threads"
+               "uiop")
+  :serial t
+  :pathname "src/search"
+  :components ((:file "package")
+               (:file "model")          ; constants, conditions, classes, EMBED-TEXTS
+               (:file "tokenizer")      ; STRIP-ANSI, TOKENIZE, QUERY-TERMS
+               (:file "kinds")          ; LINE-KINDS, CLASSIFY-LINES
+               (:file "index")          ; refs, MAKE-LOG-INDEX, refresh, .six files
+               (:file "search")))       ; SEARCH-LOGS, HIT-EXCERPT
+
 (defsystem "supervisor-protocol/tests"
-  :depends-on ("supervisor-protocol" "process-protocol" "bordeaux-threads" "rove")
+  :depends-on ("supervisor-protocol" "supervisor-protocol/search" "process-protocol"
+               "bordeaux-threads" "rove")
   :pathname "tests"
   :serial t
   :components ((:file "package")
@@ -51,7 +72,22 @@
                (:file "log-reader-test")
                (:file "log-supervisor-test")
                (:file "log-error-test")
-               (:file "log-crash-test"))
+               (:file "log-crash-test")
+               ;; H8c
+               (:module "fixtures"
+                :components ((:module "corpus"
+                              :components ((:static-file "build.log")
+                                           (:static-file "rove.log")
+                                           (:static-file "pytest.log")
+                                           (:static-file "devserver.log")))))
+               (:file "control-test")
+               (:file "search-support")
+               (:file "search-tokenizer-test")
+               (:file "search-kinds-test")
+               (:file "search-index-test")
+               (:file "search-rank-test")
+               (:file "search-golden-test")
+               (:file "search-unit-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

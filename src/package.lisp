@@ -76,6 +76,8 @@
    #:send-unit-input
    #:unit-output
    #:with-unit-interaction
+   #:restart-unit
+   #:close-unit-input
    #:*current-unit*
    #:unit-id
    #:unit-kind
@@ -128,6 +130,7 @@
    #:executor-alive-p
    #:executor-send-input
    #:executor-release
+   #:executor-close-input
    #:executor-supports-p
    ;; output
    #:output-sink
@@ -283,6 +286,7 @@
    #:stop-timeout-waited
    #:stop-failed
    #:unit-not-running
+   #:unit-input-closed
    #:executor-unsupported
    #:executor-unsupported-executor
    #:executor-unsupported-operation

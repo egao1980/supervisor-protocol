@@ -112,8 +112,11 @@
         (t :exited)))
 
 (defun %spawn-waiter (unit gen handle)
-  (bt2:make-thread (lambda () (%waiter unit gen handle))
-                   :name (format nil "supervisor waiter ~A" (unit-id unit))))
+  "Start the waiter of launch GEN; it is recorded as the unit's WAITER (RESTART-UNIT
+joins it before it reuses the unit)."
+  (setf (slot-value unit 'waiter)
+        (bt2:make-thread (lambda () (%waiter unit gen handle))
+                         :name (format nil "supervisor waiter ~A" (unit-id unit)))))
 
 (defun %waiter (unit gen handle)
   "One per launch: wait for HANDLE to end, publish the final state; relaunch on a
@@ -310,7 +313,8 @@ are cancelled. → the units it stopped (live or restart pending), in UNITS orde
   (%sink-close-quietly unit))
 
 (defun %evictable-p (unit)
-  (and (unit-finished-p unit) (not (unit-interacting-p unit))))
+  (and (unit-finished-p unit) (not (unit-interacting-p unit))
+       (not (slot-value unit 'restarting-p))))
 
 (defun %admit (sup kind owner)
   "Lock held. Evict LRU finished units at a cap. → (values verdict limit victim
@@ -694,7 +698,8 @@ all, one GRACE, STOP-TIMEOUT per unit still running, force, one FORCE-GRACE.
 
 (defun send-unit-input (unit text)
   "Write TEXT to UNIT's stdin and flush. Finished → UNIT-NOT-RUNNING; the executor
-cannot → EXECUTOR-UNSUPPORTED. → T."
+cannot → EXECUTOR-UNSUPPORTED; stdin closed by CLOSE-UNIT-INPUT on this run →
+UNIT-INPUT-CLOSED. → T."
   (check-type text string)
   (let* ((sup (unit-supervisor unit))
          (handle (%with-lock (sup)
@@ -775,7 +780,7 @@ is NIL). LABELS: a plist; each pair must be in UNIT-LABELS (EQUAL values)."
   (loop for p in (and (uiop:directory-exists-p directory)
                       (handler-case (pathlib:fs-iterdir pathlib:*filesystem* directory)
                         (error () nil)))
-        when (member (pathname-type p) '("seg" "idx") :test #'equal)
+        when (member (pathname-type p) +segment-file-types+ :test #'equal)
           sum (or (ignore-errors (pathlib:fs-file-size pathlib:*filesystem* p)) 0)))
 
 (defun %log-usage (entries)
@@ -783,7 +788,8 @@ is NIL). LABELS: a plist; each pair must be in UNIT-LABELS (EQUAL values)."
         sum (%log-directory-bytes dir)))
 
 (defun supervisor-log-usage (supervisor)
-  "Bytes of segment and index files of every unit log this supervisor wrote (units
+  "Bytes of segment, index and search index (.six, 0.3.0) files of every unit log
+this supervisor wrote (units
 evicted from the registry included; segments a Windows reader still holds open
 count until they are gone). The total cap (SUPERVISOR-LOG-TOTAL-CAP) evicts, after
 each rotation and each finished unit, while this is over it: first the segments of
@@ -883,6 +889,7 @@ the files changed."
           (pathlib:fs-write-atomic pathlib:*filesystem* (%segment-pathname dir number "idx") idx-octets)
           (%delete-path-or-defer supervisor (%rs-path j))
           (%delete-path-or-defer supervisor (%rs-idx-path j))
+          (%delete-path-or-defer supervisor (%segment-pathname dir (%rs-number j) "six"))
           t)))))
 
 (defun %log-grew (sink bytes)

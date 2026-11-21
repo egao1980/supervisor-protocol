@@ -1,0 +1,105 @@
+(in-package #:supervisor-protocol/tests)
+
+;;; H8c index over a supervisor's units: keys are unit ids, a running unit is
+;;; indexed as it writes, rotation and drops inside a unit, previous
+;;; supervisors' logs, and .six files counted in the log usage.
+
+(defun gated-writer (first-lines rest-lines gate)
+  "A thread body: print FIRST-LINES, wait until (CAR GATE) is true, print REST-LINES."
+  (lambda (u)
+    (declare (ignore u))
+    (dolist (l first-lines) (write-line l))
+    (finish-output)
+    (loop until (car gate) do (sleep 0.01))
+    (dolist (l rest-lines) (write-line l))
+    (finish-output)
+    :done))
+
+(deftest search-a-running-unit-incrementally
+  (with-temp-dir (dir)
+    (with-supervisor (sup :state-directory dir)
+      (let* ((lines (corpus-lines "build"))
+             (gate (list nil))
+             (u (start-unit sup :shell-job :function (gated-writer (subseq lines 0 30) (subseq lines 30) gate)))
+             (index (ss:make-log-index :supervisor sup)))
+        (unwind-protect
+             (progn
+               (ok (wait-until (lambda () (>= (or (ignore-errors (log-last-line u)) 0) 31)) :timeout 10))
+               (ok (equal (list (unit-id u)) (ss:index-log-keys index)) "keyed by unit id")
+               (ok (equal (unit-id u) (ss:index-log-key index u)))
+               (let ((hit (first (ss:search-logs index "undeclared identifier tokn"))))
+                 (ok (and hit (equal (unit-id u) (ss:hit-key hit))))
+                 (ok (and hit (equal (ref-of-text u (unit-id u) (nth 18 lines)) (ss:hit-ref hit)))))
+               (ok (null (ss:search-logs index "unused variable")) "not written yet")
+               (setf (car gate) t)
+               (wait-unit u :timeout 10)
+               (ok (wait-until (lambda () (log-closed-p u)) :timeout 10))
+               (ok (in-top-p (ref-of-text u (unit-id u) (nth 45 lines)) index "unused variable" :k 3)
+                   "the rest, after the unit finished")
+               (ok (= 51 (stat index :tokenized)) "every record tokenized once")
+               (ok (equal '(:exit) (ss:hit-kinds (first (ss:search-logs index "" :kinds '(:exit)))))))
+          (ss:close-log-index index))))))
+
+(deftest search-a-rotated-unit-after-a-drop
+  (with-temp-dir (dir)
+    (with-supervisor (sup :state-directory dir :log-max-record 256)
+      (let* ((u (start-unit sup :shell-job :function (lambda (u) (declare (ignore u))
+                                                        (dolist (l (word-lines 1 300)) (write-line l))
+                                                        :done)
+                                         :log-segment-size 2048 :log-segments 2))
+             (index (ss:make-log-index :supervisor sup)))
+        (unwind-protect
+             (progn
+               (wait-unit u :timeout 20)
+               (ok (wait-until (lambda () (log-closed-p u)) :timeout 10))
+               (ok (nth-value 1 (log-read u)) "the oldest segments were dropped")
+               (ok (null (ss:search-logs index "word00001")) "a dropped line is not found")
+               (let ((hit (first (ss:search-logs index "word00300"))))
+                 (ok hit)
+                 (ok (member (ss:hit-segment hit) (mapcar #'log-segment-number (log-segments u))))))
+          (ss:close-log-index index))))))
+
+(deftest search-previous-supervisor-logs
+  (with-temp-dir (dir)
+    (let (old-key)
+      (with-supervisor (sup1 :state-directory dir)
+        (let ((u (start-unit sup1 :shell-job :function (writer-body '("previous session marker-xyzzy")))))
+          (wait-unit u :timeout 10)
+          (wait-until (lambda () (log-closed-p u)) :timeout 10)
+          (setf old-key (format nil "~A--~A" (supervisor-id sup1) (unit-id u)))))
+      (with-supervisor (sup2 :state-directory dir)
+        (let ((u (start-unit sup2 :shell-job :function (writer-body '("current session line")))))
+          (wait-unit u :timeout 10)
+          (let ((index (ss:make-log-index :supervisor sup2)))
+            (ok (equal (list (unit-id u) old-key) (ss:index-log-keys index))
+                "own units first, then other supervisors' logs by directory name")
+            (ok (equal (list old-key) (mapcar #'ss:hit-key (ss:search-logs index "marker-xyzzy"))))
+            (ss:close-log-index index))
+          (let ((index (ss:make-log-index :supervisor sup2 :previous nil)))
+            (ok (equal (list (unit-id u)) (ss:index-log-keys index)))
+            (ok (null (ss:search-logs index "marker-xyzzy")))
+            (ss:close-log-index index)))))))
+
+(deftest search-index-files-count-in-log-usage
+  (with-temp-dir (dir)
+    (with-supervisor (sup :state-directory dir)
+      (let ((u (start-unit sup :shell-job :function (writer-body (word-lines 1 50))))
+            (index (ss:make-log-index :supervisor sup)))
+        (wait-unit u :timeout 10)
+        (wait-until (lambda () (log-closed-p u)) :timeout 10)
+        (ss:refresh-index index)
+        (let ((ldir (unit-log-dir sup u)))
+          (ok (six-files ldir) "the closed log's segment is persisted")
+          (ok (= (files-bytes (append (segment-files ldir) (index-files ldir) (six-files ldir)))
+                 (supervisor-log-usage sup))
+              "0.3.0: segment, index and .six files count"))
+        (ss:close-log-index index)))))
+
+(deftest search-supervisor-without-state-directory
+  (with-supervisor (sup)
+    (let ((u (start-unit sup :shell-job :function (writer-body '("memory only"))))
+          (index (ss:make-log-index :supervisor sup)))
+      (wait-unit u :timeout 10)
+      (ok (null (ss:index-log-keys index)) "no logs to index")
+      (ok (null (ss:search-logs index "memory")))
+      (ss:close-log-index index))))

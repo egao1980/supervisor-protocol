@@ -125,7 +125,12 @@ its files while it writes."))
 
 ;;; Defined later (src/events.lisp, src/supervisor.lisp).
 (declaim (ftype function %publish %register-log %log-sink-finished %log-cap-changed
-                %log-grew %abort-unit-no-wait))
+                %log-grew %abort-unit-no-wait %scan-log %segment-first-line %segment-output-bytes
+                %log-resume-state))
+
+(defparameter +segment-file-types+ '("seg" "idx" "six")
+  "The files of one segment: records, record index, and (0.3.0) the search index
+of supervisor-protocol/search. Dropping a segment deletes all of them.")
 
 (defun unit-log-pathname (state-directory supervisor-id unit-id)
   "<STATE-DIRECTORY>/units/<SUPERVISOR-ID>--<UNIT-ID>/ (a directory pathname)."
@@ -134,7 +139,7 @@ its files while it writes."))
                    (uiop:ensure-directory-pathname state-directory)))
 
 (defun %segment-pathname (directory number type)
-  "DIRECTORY/NNNNNNNN.<TYPE> (TYPE \"seg\" or \"idx\")."
+  "DIRECTORY/NNNNNNNN.<TYPE> (TYPE \"seg\", \"idx\" or \"six\")."
   (merge-pathnames (format nil "~8,'0D.~A" number type) (uiop:ensure-directory-pathname directory)))
 
 (defparameter +make-log-sink-keys+
@@ -461,8 +466,8 @@ first), then its files are deleted (or the delete deferred)."
         (incf (slot-value sink 'dropped-records) records)
         (incf (slot-value sink 'dropped-bytes) (%seg-output-bytes j))
         (let ((dir (log-sink-directory sink)))
-          (%delete-or-defer sink (%segment-pathname dir (%seg-number j) "seg"))
-          (%delete-or-defer sink (%segment-pathname dir (%seg-number j) "idx")))
+          (dolist (type +segment-file-types+)
+            (%delete-or-defer sink (%segment-pathname dir (%seg-number j) type))))
         t))))
 
 (defun %rotate (sink)
@@ -646,6 +651,67 @@ tail. → (values v start end), the complete part."
           (setf (slot-value sink 'rotated-p) nil))))
     (when done (%notify sink))
     done))
+
+(defun %log-sink-reopen (sink)
+  "H8c RESTART-UNIT: the closed SINK takes a new run. Its state is resynced from the
+directory (a total-cap stub may have replaced segments meanwhile), and segment N+1
+is opened with its header after the end record, so lines continue in one sequence
+and the newest segment, the one without an end record, decides LOG-CLOSED-P.
+The head + tail keep the previous runs' text (as a policy restart does). A sink
+that went memory-only stays so. → SINK."
+  (let* ((entry (slot-value sink 'entry))
+         (sup (and entry (%le-supervisor entry)))
+         (reopened nil))
+    (flet ((reopen ()
+             (%with-writer (sink)
+               (when (and (slot-value sink 'log-closed-p)
+                          (not (eq (slot-value sink 'writer) (bt2:current-thread))))
+                 (setf reopened t)
+                 (bt2:with-lock-held ((slot-value sink 'lock))
+                   (setf (slot-value sink 'closed-p) nil))
+                 (setf (slot-value sink 'log-closed-p) nil
+                       (slot-value sink 'rotated-p) nil
+                       (slot-value sink 'carry-out) nil
+                       (slot-value sink 'carry-err) nil)
+                 (unless (log-sink-memory-only-p sink)
+                   (%as-writer (sink)
+                     (catch '%memory-only
+                       (multiple-value-bind (number next retained through records bytes)
+                           (%log-resume-state (log-sink-directory sink))
+                         (setf (slot-value sink 'seg-number) (max (slot-value sink 'seg-number) number)
+                               (slot-value sink 'next-line) (max (slot-value sink 'next-line) next)
+                               (slot-value sink 'retained) retained
+                               (slot-value sink 'dropped-through)
+                               (max (slot-value sink 'dropped-through) through)
+                               (slot-value sink 'dropped-records)
+                               (max (slot-value sink 'dropped-records) records)
+                               (slot-value sink 'dropped-bytes)
+                               (max (slot-value sink 'dropped-bytes) bytes)))
+                       (%stamp sink)
+                       (%open-next-segment sink)
+                       (loop while (> (1+ (length (slot-value sink 'retained))) (log-sink-segments sink))
+                             do (%drop-oldest-now sink :rotated))
+                       (%flush sink)
+                       (%retry-deferred sink))
+                     (setf (slot-value sink 'flushed) 0
+                           (slot-value sink 'rotated-p) nil)))))))
+      (if sup
+          ;; The cap enforcer (log-enforcing → writer lock) must not step on the
+          ;; directory while it is resynced; the entry is live again after.
+          (bt2:with-lock-held ((slot-value sup 'log-enforcing))
+            (reopen)
+            (when reopened
+              (bt2:with-lock-held ((slot-value sup 'log-lock))
+                (setf (%le-finished entry) nil
+                      (%le-sink entry) sink
+                      (%le-stub-p entry) nil))))
+          (reopen)))
+    (when reopened
+      (%notify sink)
+      ;; A cap pass that found the enforcer busy (us) left its flag: run it now.
+      (%log-cap-changed sink))
+    (%run-deferred-stop)
+    sink))
 
 (defun %log-sink-retry-deferred (sink)
   (%with-writer (sink)
