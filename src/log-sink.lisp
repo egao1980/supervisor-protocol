@@ -248,32 +248,10 @@ time at the first call plus the internal real time since."
   (setf (slot-value sink 'wall) (%wall-ms)
         (slot-value sink 'mono) (%mono-ms)))
 
-;;; Write errors (CLHS 9). The sink offers LOG-WRITE-ERROR to the writing
-;;; thread's handlers for LOG-WRITE-ERROR (or a subtype). A handler for a
-;;; supertype (ERROR, SERIOUS-CONDITION …) is a generic clean-up wrapper
-;;; (HANDLER-CASE ERROR around a call, a test runner): it is not offered the
-;;; condition, because the default outcome is to keep going (memory-only), not
-;;; to unwind. SBCL: the handler clusters are filtered by type for the SIGNAL.
-
-#+sbcl
-(defun %log-error-binding-p (binding)
-  (let ((test (car binding)))
-    (flet ((specific (name) (and (symbolp name) (find-class name nil)
-                                 (subtypep name 'log-write-error))))
-      (typecase test
-        (symbol (specific test))
-        (sb-kernel::classoid-cell (specific (sb-kernel::classoid-cell-name test)))
-        (t nil)))))
-
-(defun %signal-log-write-error (condition)
-  #+sbcl
-  (let ((sb-kernel:*handler-clusters*
-          (loop for cluster in sb-kernel:*handler-clusters*
-                for kept = (remove-if-not #'%log-error-binding-p cluster)
-                when kept collect kept)))
-    (signal condition))
-  #-sbcl
-  (signal condition))
+;;; Write errors (CLHS 9). LOG-WRITE-ERROR is a signalled condition, not an
+;;; ERROR: the writing thread's handlers for it (or a supertype short of ERROR)
+;;; see it; handlers on ERROR never do, so an unhandled write error keeps going
+;;; (memory-only) instead of unwinding.
 
 (defun %publish-log-error (unit action path cause)
   (let ((sup (unit-supervisor unit)))
@@ -297,7 +275,7 @@ time at the first call plus the internal real time since."
                     (restart-case
                         (progn
                           ;; 1. the writing thread's handlers
-                          (%signal-log-write-error c)
+                          (signal c)
                           ;; 2. the supervisor's handler
                           (let ((h (and sup (supervisor-log-error-handler sup))))
                             (when h
