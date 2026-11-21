@@ -207,26 +207,36 @@ line numbers of a program's output depend on its bytes, not on read timing
            :name (format nil "supervisor pump ~A ~(~A~)" (unit-id unit) which))
           pumps)))
 
-(defmethod executor-launch ((executor process-executor) unit)
-  (let* ((command (unit-command unit))
-         (backend (process-executor-backend executor))
-         (process
-           (handler-case
-               (apply #'pp:launch command
-                      :process-group t
-                      :input :stream :output :stream :error-output :stream
-                      :element-type :octets
-                      (append (and (unit-cwd unit) (list :directory (unit-cwd unit)))
-                              (and (unit-env unit) (list :env (unit-env unit)))
-                              (and backend (list :backend backend))))
-             (error (e)
-               (error 'unit-start-error :supervisor (unit-supervisor unit)
-                                        :kind (unit-kind unit) :command command :cause e))))
-         (handle (make-instance 'process-unit-handle :process process :pid (pp:pid process)))
-         (sink (unit-output-sink unit)))
+(defun %launch-process (executor unit argv &rest keys)
+  "PP:LAUNCH of ARGV as the process executor launches: :PROCESS-GROUP T, three octet
+pipes, then KEYS, then :BACKEND when EXECUTOR has one. → the process. A launch error →
+UNIT-START-ERROR (command: UNIT-COMMAND) with it as cause."
+  (let ((backend (process-executor-backend executor)))
+    (handler-case
+        (apply #'pp:launch argv
+               :process-group t
+               :input :stream :output :stream :error-output :stream
+               :element-type :octets
+               (append keys (and backend (list :backend backend))))
+      (error (e)
+        (error 'unit-start-error :supervisor (unit-supervisor unit)
+                                 :kind (unit-kind unit) :command (unit-command unit) :cause e)))))
+
+(defun %start-process-handle (unit process &optional (class 'process-unit-handle) &rest initargs)
+  "A handle of CLASS (a PROCESS-UNIT-HANDLE, with INITARGS) on PROCESS, its stdout and
+stderr pumped into UNIT-OUTPUT-SINK. → the handle."
+  (let ((handle (apply #'make-instance class :process process :pid (pp:pid process) initargs))
+        (sink (unit-output-sink unit)))
     (when (pp:stdout process) (%start-pump handle (pp:stdout process) sink :stdout unit))
     (when (pp:stderr process) (%start-pump handle (pp:stderr process) sink :stderr unit))
     handle))
+
+(defmethod executor-launch ((executor process-executor) unit)
+  (%start-process-handle
+   unit
+   (apply #'%launch-process executor unit (unit-command unit)
+          (append (and (unit-cwd unit) (list :directory (unit-cwd unit)))
+                  (and (unit-env unit) (list :env (unit-env unit)))))))
 
 (defmethod executor-pid ((executor process-executor) handle)
   (%ph-pid handle))
