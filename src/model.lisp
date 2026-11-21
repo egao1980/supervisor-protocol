@@ -12,10 +12,13 @@
 (defparameter +live-states+ '(:starting :running))
 (defparameter +final-states+ '(:exited :killed :failed))
 
-(defparameter +event-types+ '(:state :restart-scheduled :evicted)
+(defparameter +event-types+ '(:state :restart-scheduled :evicted :log-error)
   ":STATE a state change (FROM → TO; FROM is NIL for the first event of a unit);
 :RESTART-SCHEDULED a :FAILED unit will relaunch (detail :ATTEMPT :DELAY);
-:EVICTED the unit left the registry (FROM its final state, TO NIL).")
+:EVICTED the unit left the registry (FROM its final state, TO NIL);
+:LOG-ERROR (H8b) writing the unit's log failed (FROM and TO both the unit's state
+at that moment; detail :ACTION :MEMORY-ONLY | :RETRY | :ABORT-UNIT, :PATH the
+native namestring, :MESSAGE the cause's report).")
 
 (defparameter +scope-kinds+ '(:supervisor :session :agent :tool-source)
   "Known scope kinds. :SUPERVISOR is the root. Any other keyword is accepted.")
@@ -29,6 +32,23 @@
 (defconstant +default-head-size+ 16384 "Characters kept from the start of a unit's output.")
 (defconstant +default-tail-size+ 65536 "Characters kept from the end of a unit's output.")
 (defparameter +default-sweep-grace+ 0.5 "Seconds between TERM and KILL in the orphan sweep.")
+
+;;; H8b: rotated, capped unit logs (src/log-format.lisp, log-sink.lisp, log-reader.lisp).
+(defconstant +log-format+ 1 "Version of the segment record format and of the index layout.")
+(defconstant +default-log-segment-size+ 1048576 "Maximum bytes of one segment file.")
+(defconstant +default-log-segments+ 5 "Segments retained per unit; older ones are dropped.")
+(defconstant +default-log-total-cap+ 268435456
+  "Bytes (segment + index files) of all unit logs of one supervisor.")
+(defconstant +default-log-max-record+ 8192
+  "Maximum output octets in one record; longer lines are split into continued records.")
+(defconstant +log-index-stride+ 64 "One index entry per this many records.")
+(defparameter +log-record-types+ '(:output :header :drop :end)
+  ":OUTPUT unit output (stream :STDOUT / :STDERR); :HEADER the first record of every
+segment; :DROP the marker a dropped segment leaves; :END the log was closed.")
+(defparameter +log-gap-reasons+ '(:rotated :total-cap :corrupt :missing)
+  ":ROTATED the unit's segment count was exceeded; :TOTAL-CAP the supervisor's total
+cap evicted it; :CORRUPT bytes that are not valid records; :MISSING lines absent
+with no marker (a segment deleted from outside).")
 
 (defvar *current-scope* nil
   "The default owner of new units and parent of new scopes: bound by WITH-SCOPE and
@@ -113,6 +133,20 @@ min(max, initial × factor^(attempt − 1))."
    (output-sink-factory :initarg :output-sink-factory :initform 'default-output-sink
                         :reader supervisor-output-sink-factory
                         :documentation "Function of a unit → its OUTPUT-SINK. H8b plugs rotated logs in here.")
+   ;; H8b
+   (log-p :initarg :log :initform t :reader supervisor-log-p
+          :documentation "With a state directory: T → units log to files by default.")
+   (log-segment-size :initarg :log-segment-size :initform +default-log-segment-size+
+                     :reader supervisor-log-segment-size)
+   (log-segments :initarg :log-segments :initform +default-log-segments+
+                 :reader supervisor-log-segments)
+   (log-total-cap :initarg :log-total-cap :initform +default-log-total-cap+
+                  :reader supervisor-log-total-cap)
+   (log-max-record :initarg :log-max-record :initform +default-log-max-record+
+                   :reader supervisor-log-max-record)
+   (log-error-handler :initarg :log-error-handler :initform nil
+                      :reader supervisor-log-error-handler
+                      :documentation "Function of a LOG-WRITE-ERROR, called when the dynamic handlers declined; may invoke a restart.")
    (sweep-report :initform nil :reader supervisor-sweep-report
                  :documentation "SWEEP-RECORDs of the sweep MAKE-SUPERVISOR ran.")
    (closed-p :initform nil :reader supervisor-closed-p)
@@ -135,7 +169,16 @@ min(max, initial × factor^(attempt − 1))."
    (dispatcher :initform nil)
    (dispatch-closing :initform nil)
    (dispatch-done :initform nil)
-   (os-start :initform nil :documentation "This image's OS start string (lazy).")))
+   (os-start :initform nil :documentation "This image's OS start string (lazy).")
+   ;; H8b: every log this supervisor wrote (the total cap), guarded by LOG-LOCK
+   (log-lock :initform (bt2:make-lock :name "supervisor logs"))
+   (log-entries :initform '() :documentation "%LOG-ENTRYs in creation order.")
+   (log-tick :initform 0 :documentation "Finish order of logs.")
+   (log-deferred :initform '() :documentation "Paths whose delete failed (Windows).")
+   (log-enforcing :initform (bt2:make-lock :name "supervisor log cap"))
+   (log-enforce-pending :initform nil)
+   (log-estimate :initform 0 :documentation "Usage at the last cap pass + bytes written since.")
+   (log-trigger-at :initform nil :documentation "LOG-ESTIMATE above this runs a cap pass (NIL: the cap).")))
 
 ;;; ------------------------------------------------------------------
 ;;; Scopes
@@ -196,6 +239,8 @@ min(max, initial × factor^(attempt − 1))."
    (handle :initform nil)
    (supervisor :initarg :supervisor :reader unit-supervisor)
    (output-sink :initform nil :reader unit-output-sink)
+   (log-settings :initarg :log-settings :initform nil :reader unit-log-settings
+                 :documentation "H8b, effective: (:ENABLED bool :SEGMENT-SIZE n :SEGMENTS k).")
    (file-path :initform nil :reader unit-file-path
               :documentation "Its unit file while one exists, else NIL.")
    ;; internal

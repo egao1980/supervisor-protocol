@@ -6,7 +6,7 @@
   (ok (equal +unit-states+ '(:starting :running :exited :killed :failed)))
   (ok (equal +live-states+ '(:starting :running)))
   (ok (equal +final-states+ '(:exited :killed :failed)))
-  (ok (equal +event-types+ '(:state :restart-scheduled :evicted)))
+  (ok (equal +event-types+ '(:state :restart-scheduled :evicted :log-error)) "H8b adds :log-error")
   (ok (equal +scope-kinds+ '(:supervisor :session :agent :tool-source)))
   (ok (= 1 +unit-file-format+))
   (ok (equal +default-backoff+ '(0.5 2 30)))

@@ -1,6 +1,8 @@
 (defpackage #:supervisor-protocol
   (:use #:cl)
-  (:local-nicknames (#:pp #:process-protocol))
+  (:local-nicknames (#:pp #:process-protocol)
+                    (#:pathlib #:cl-stack-pathlib)
+                    (#:stack-encoding #:encoding-protocol))
   (:export
    ;; constants
    #:+unit-states+
@@ -17,6 +19,14 @@
    #:+default-head-size+
    #:+default-tail-size+
    #:+default-sweep-grace+
+   #:+log-format+
+   #:+default-log-segment-size+
+   #:+default-log-segments+
+   #:+default-log-total-cap+
+   #:+default-log-max-record+
+   #:+log-index-stride+
+   #:+log-record-types+
+   #:+log-gap-reasons+
    ;; supervisor
    #:supervisor
    #:make-supervisor
@@ -35,6 +45,13 @@
    #:supervisor-exit-hook
    #:live-supervisors
    #:shutdown-supervisor
+   #:supervisor-log-p
+   #:supervisor-log-segment-size
+   #:supervisor-log-segments
+   #:supervisor-log-total-cap
+   #:supervisor-log-max-record
+   #:supervisor-log-error-handler
+   #:supervisor-log-usage
    ;; scopes
    #:scope
    #:make-scope
@@ -90,6 +107,7 @@
    #:unit-supervisor
    #:unit-output-sink
    #:unit-file-path
+   #:unit-log-settings
    #:kind-default-restart
    #:restart-delay
    ;; queries
@@ -122,6 +140,76 @@
    #:sink-text
    #:sink-stats
    #:sink-close
+   #:sink-write-octets
+   ;; H8b log sinks
+   #:log-sink
+   #:make-log-sink
+   #:log-sink-directory
+   #:log-sink-unit
+   #:log-sink-supervisor-id
+   #:log-sink-unit-id
+   #:log-sink-kind
+   #:log-sink-segment-size
+   #:log-sink-segments
+   #:log-sink-max-record
+   #:log-sink-index-stride
+   #:log-sink-memory-only-p
+   #:log-sink-last-line
+   #:log-open-segment-stream
+   #:unit-log-pathname
+   #:sink-output-stream
+   #:sink-output-stream-sink
+   #:sink-output-stream-name
+   #:make-sink-output-stream
+   ;; H8b records
+   #:log-record
+   #:make-log-record
+   #:log-record-line
+   #:log-record-wall-time
+   #:log-record-monotonic
+   #:log-record-type
+   #:log-record-stream
+   #:log-record-octets
+   #:log-record-text
+   #:log-record-continued-p
+   #:log-record-detail
+   #:log-record-segment
+   #:log-record-offset
+   #:format-log-record
+   #:parse-log-record
+   ;; H8b readers
+   #:unit-log
+   #:unit-log-directory
+   #:unit-log-supervisor-id
+   #:unit-log-unit-id
+   #:find-unit-logs
+   #:log-gap
+   #:log-gap-first-line
+   #:log-gap-last-line
+   #:log-gap-records
+   #:log-gap-bytes
+   #:log-gap-reasons
+   #:log-segment-info
+   #:log-segment-number
+   #:log-segment-path
+   #:log-segment-index-path
+   #:log-segment-first-line
+   #:log-segment-last-line
+   #:log-segment-records
+   #:log-segment-bytes
+   #:log-segment-output-bytes
+   #:log-segment-first-time
+   #:log-segment-last-time
+   #:log-segment-torn-p
+   #:log-segments
+   #:log-read
+   #:log-tail
+   #:log-follow
+   #:map-log-records
+   #:log-last-line
+   #:log-closed-p
+   #:rebuild-log-index
+   #:delete-unit-log
    ;; events
    #:unit-event
    #:event-seq
@@ -201,8 +289,18 @@
    #:unit-file-unreadable
    #:unit-file-unreadable-path
    #:unit-file-unreadable-cause
+   #:log-write-error
+   #:log-write-error-sink
+   #:log-write-error-unit
+   #:log-write-error-path
+   #:log-write-error-cause
+   #:log-not-found
+   #:log-not-found-path
    ;; restarts
    #:evict-lru
    #:force
    #:keep-waiting
-   #:abandon))
+   #:abandon
+   #:retry
+   #:drop-to-memory-only
+   #:abort-unit))
