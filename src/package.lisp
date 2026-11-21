@@ -1,6 +1,7 @@
 (defpackage #:supervisor-protocol
   (:use #:cl)
   (:local-nicknames (#:pp #:process-protocol)
+                    (#:sc #:compute-protocol)
                     (#:pathlib #:cl-stack-pathlib)
                     (#:stack-encoding #:encoding-protocol))
   (:export
@@ -122,6 +123,15 @@
    #:thread-executor
    #:make-process-executor
    #:make-thread-executor
+   ;; R4d-0: confined units
+   #:compute-executor
+   #:make-compute-executor
+   #:compute-executor-compute-backend
+   #:compute-executor-confinement
+   #:supervisor-compute-executor
+   #:unit-confinement
+   #:unit-confined-p
+   #:unit-confined-launch
    #:executor-launch
    #:executor-pid
    #:executor-pgid

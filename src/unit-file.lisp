@@ -61,6 +61,9 @@
                           :command (unit-command unit)
                           :cwd (uiop:native-namestring (or (unit-cwd unit) (uiop:getcwd)))
                           :inspector (if (uiop:os-windows-p) :cim :ps)))
+             (plist (if (unit-confinement unit)
+                        (append plist (%unit-file-confinement unit))
+                        plist))
              (temp (make-pathname :type "tmp" :defaults path)))
         (ensure-directories-exist path)
         (with-open-file (s temp :direction :output :if-exists :supersede

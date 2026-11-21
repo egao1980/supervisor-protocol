@@ -154,6 +154,8 @@ min(max, initial × factor^(attempt − 1))."
               :documentation "The function registered as image exit hook, or NIL.")
    (process-executor :initarg :process-executor :initform nil)
    (thread-executor :initarg :thread-executor :initform nil)
+   (compute-executor :initarg :compute-executor :initform nil :reader supervisor-compute-executor
+                     :documentation "R4d-0: the executor for START-UNIT :CONFINEMENT, or NIL.")
    (lock :initform (bt2:make-lock :name "supervisor"))
    ;; internal state, all guarded by LOCK
    (cv :initform (bt2:make-condition-variable :name "supervisor state"))
@@ -215,6 +217,8 @@ min(max, initial × factor^(attempt − 1))."
    (body :initarg :function :initform nil :reader unit-function :documentation "Thread body, or NIL.")
    (cwd :initarg :cwd :initform nil :reader unit-cwd)
    (env :initarg :env :initform nil :reader unit-env)
+   (confinement :initarg :confinement :initform nil :reader unit-confinement
+                :documentation "R4d-0: the STACK-COMPUTE:CONFINEMENT the unit runs under, or NIL.")
    (pid :initform nil :reader unit-pid)
    (pgid :initform nil :reader unit-pgid)
    (start-time :initform nil :reader unit-start-time :documentation "Universal time of the last launch.")

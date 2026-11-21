@@ -376,6 +376,7 @@ cap-owner evicted): VERDICT :OK or :FULL."
                              (output-sink-factory 'default-output-sink)
                              (process-executor (make-process-executor))
                              (thread-executor (make-thread-executor))
+                             compute-executor
                              (log t)
                              (log-segment-size +default-log-segment-size+)
                              (log-segments +default-log-segments+)
@@ -394,7 +395,8 @@ segment files under <state-directory>/units/<supervisor-id>--<unit-id>/ (see
 DEFAULT-OUTPUT-SINK): LOG-SEGMENT-SIZE bytes × LOG-SEGMENTS per unit, LOG-MAX-RECORD
 output octets per record, LOG-TOTAL-CAP bytes for all of this supervisor's logs.
 LOG-ERROR-HANDLER: a function of a LOG-WRITE-ERROR, called when the dynamic
-handlers declined; it may invoke RETRY, DROP-TO-MEMORY-ONLY or ABORT-UNIT."
+handlers declined; it may invoke RETRY, DROP-TO-MEMORY-ONLY or ABORT-UNIT.
+R4d-0: COMPUTE-EXECUTOR (a COMPUTE-EXECUTOR, or NIL) runs START-UNIT :CONFINEMENT units."
   (check-type event-capacity (integer 0))
   (check-type log-segment-size (integer 1))
   (check-type log-segments (integer 1))
@@ -410,6 +412,7 @@ handlers declined; it may invoke RETRY, DROP-TO-MEMORY-ONLY or ABORT-UNIT."
                                          :output-sink-factory output-sink-factory
                                          :process-executor process-executor
                                          :thread-executor thread-executor
+                                         :compute-executor compute-executor
                                          :log log :log-segment-size log-segment-size
                                          :log-segments log-segments :log-total-cap log-total-cap
                                          :log-max-record log-max-record
@@ -532,7 +535,7 @@ scope → SUPERVISOR-ERROR (use SHUTDOWN-SUPERVISOR)."
 
 (defun start-unit (supervisor kind &key command function owner labels cwd env executor
                                         restart max-restarts backoff interacting
-                                        (log t) log-segment-size log-segments)
+                                        (log t) log-segment-size log-segments confinement)
   "Register and launch a unit. → the UNIT (state :RUNNING), or NIL when the ABORT
 restart was taken.
 KIND: a keyword (open set: :SHELL-JOB :LSP :RPC :IMAGE :PTY :SUBAGENT …).
@@ -546,6 +549,12 @@ RESTART :NEVER | :ON-FAILURE (default KIND-DEFAULT-RESTART), MAX-RESTARTS
 +DEFAULT-BACKOFF+. INTERACTING: the initial UNIT-INTERACTING-P.
 H8b: LOG NIL keeps this unit's output in memory only; LOG-SEGMENT-SIZE and
 LOG-SEGMENTS override the supervisor's (UNIT-LOG-SETTINGS has the effective ones).
+R4d-0: CONFINEMENT (a STACK-COMPUTE:CONFINEMENT) runs COMMAND confined, on EXECUTOR
+when it is a COMPUTE-EXECUTOR, else on SUPERVISOR-COMPUTE-EXECUTOR. A COMPUTE-EXECUTOR
+given without CONFINEMENT uses COMPUTE-EXECUTOR-CONFINEMENT. No compute executor, no
+confinement for one, a FUNCTION, or another :EXECUTOR → UNIT-START-ERROR; a
+confinement the backend refuses → UNIT-START-ERROR whose cause is the compute
+condition (CONFINEMENT-UNSUPPORTED, CONFINEMENT-UNAVAILABLE, INVALID-CONFINEMENT).
 Caps (SUPERVISOR-KIND-CAPS, SUPERVISOR-OWNER-CAP) count retained units, any state.
 At a cap the least recently used finished unit is evicted silently; with none,
 UNIT-LIMIT-REACHED is signalled (ERROR) with restarts EVICT-LRU (offered when a
@@ -557,7 +566,12 @@ SCOPE-CLOSED. Shut-down supervisor → SUPERVISOR-CLOSED."
   (let ((sup supervisor))
     (when (supervisor-closed-p sup)
       (error 'supervisor-closed :supervisor sup))
-    (let* ((exec (cond (executor executor)
+    (let* ((exec (cond ((or confinement (typep executor 'compute-executor))
+                        (multiple-value-bind (e c)
+                            (%confined-executor sup kind command function executor confinement)
+                          (setf confinement c)
+                          e))
+                       (executor executor)
                        ((and command (not function)) (slot-value sup 'process-executor))
                        ((and function (not command)) (slot-value sup 'thread-executor))
                        (t (error 'unit-start-error
@@ -599,6 +613,7 @@ SCOPE-CLOSED. Shut-down supervisor → SUPERVISOR-CLOSED."
         (let ((unit (make-instance 'unit :id (format nil "~(~A~)-~D" kind n) :kind kind
                                          :owner owner :labels labels :command command
                                          :function function :cwd cwd :env env
+                                         :confinement confinement
                                          :restart-policy (or restart (kind-default-restart kind))
                                          :max-restarts (or max-restarts +default-max-restarts+)
                                          :backoff (or backoff +default-backoff+)

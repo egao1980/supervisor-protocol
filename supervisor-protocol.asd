@@ -1,10 +1,11 @@
 (defsystem "supervisor-protocol"
-  :version "0.3.1"
-  :description "Process supervisor for the cl-stack harness: units, scopes, caps, restarts, events, orphan sweep, rotated capped unit logs, manual restart and stdin close"
+  :version "0.4.0"
+  :description "Process supervisor for the cl-stack harness: units, scopes, caps, restarts, events, orphan sweep, rotated capped unit logs, manual restart and stdin close, confined units through compute-protocol"
   :author "egao1980"
   :license "MIT"
   :depends-on ((:version "process-protocol" "0.4.1")
                (:version "process-backend-uiop" "0.3.1")
+               (:version "compute-protocol" "0.3.0")
                (:version "cl-stack-pathlib" "0.9.0")
                (:version "encoding-protocol" "0.2.0")
                "trivial-gray-streams"
@@ -21,6 +22,7 @@
                (:file "log-reader")     ; H8b: read / tail / follow / segments across rotations
                (:file "os")             ; current pid, OS process inspectors (ps / CIM), OS kills
                (:file "executor")       ; executor GFs: process-protocol and in-image threads
+               (:file "confine")        ; R4d-0: the compute executor (confined process units)
                (:file "events")         ; sequence log, replay, subscriptions
                (:file "unit-file")      ; durable unit files and the orphan sweep
                (:file "supervisor")     ; make-supervisor, start/stop/wait, caps, restarts, queries
@@ -28,11 +30,11 @@
   :in-order-to ((test-op (test-op "supervisor-protocol/tests"))))
 
 (defsystem "supervisor-protocol/search"
-  :version "0.3.1"
+  :version "0.4.0"
   :description "H8c: incremental BM25 index and structured hits (errors, warnings, stack traces, test failures, exits) over supervisor unit logs"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "supervisor-protocol" "0.3.1")
+  :depends-on ((:version "supervisor-protocol" "0.4.0")
                (:version "cl-stack-pathlib" "0.9.0")
                (:version "encoding-protocol" "0.2.0")
                "bordeaux-threads"
@@ -48,7 +50,7 @@
 
 (defsystem "supervisor-protocol/tests"
   :depends-on ("supervisor-protocol" "supervisor-protocol/search" "process-protocol"
-               "bordeaux-threads" "rove")
+               "compute-protocol" "bordeaux-threads" "rove")
   :pathname "tests"
   :serial t
   :components ((:file "package")
@@ -88,7 +90,9 @@
                (:file "search-index-test")
                (:file "search-rank-test")
                (:file "search-golden-test")
-               (:file "search-unit-test"))
+               (:file "search-unit-test")
+               ;; R4d-0
+               (:file "confine-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
