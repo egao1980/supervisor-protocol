@@ -30,7 +30,13 @@ ignored; SINK-TEXT still answers. Idempotent. → NIL.")
 (defclass head-tail-buffer (output-sink)
   ((head-size :initarg :head-size :reader head-tail-buffer-head-size)
    (tail-size :initarg :tail-size :reader head-tail-buffer-tail-size)
-   (lock :initform (bt2:make-lock :name "head-tail-buffer")))
+   (lock :initform (bt2:make-lock :name "head-tail-buffer"))
+   (head :initform (make-array 64 :element-type 'character :adjustable t :fill-pointer 0))
+   (tail :initform (make-array 64 :element-type 'character :adjustable t :fill-pointer 0))
+   (tail-start :initform 0)
+   (total :initform 0)
+   (dropped :initform 0)
+   (closed-p :initform nil))
   (:documentation "The first HEAD-SIZE and the last TAIL-SIZE characters of a unit's output
 (Codex unified_exec). Memory is bounded by HEAD-SIZE + TAIL-SIZE."))
 
@@ -44,15 +50,49 @@ ignored; SINK-TEXT still answers. Idempotent. → NIL.")
   (declare (ignore unit))
   (make-head-tail-buffer))
 
+;;; HEAD fills first (up to HEAD-SIZE); everything after goes to TAIL, a string
+;;; whose live part is [TAIL-START, fill-pointer) and at most TAIL-SIZE long.
+;;; Characters pushed out of the front of the tail are counted in DROPPED; the
+;;; dead prefix is compacted away once it is longer than TAIL-SIZE.
+
 (defmethod sink-write ((sink head-tail-buffer) stream text)
-  (declare (ignore stream text))
-  (%h8a-pending "sink-write head-tail-buffer"))
+  (declare (ignore stream))
+  (check-type text string)
+  (bt2:with-lock-held ((slot-value sink 'lock))
+    (with-slots (head-size tail-size head tail tail-start total dropped closed-p) sink
+      (unless closed-p
+        (let* ((n (length text))
+               (room (- head-size (length head)))
+               (into-head (max 0 (min room n))))
+          (incf total n)
+          (loop for i below into-head do (vector-push-extend (char text i) head))
+          (loop for i from into-head below n do (vector-push-extend (char text i) tail))
+          (let ((excess (- (fill-pointer tail) tail-start tail-size)))
+            (when (plusp excess)
+              (incf tail-start excess)
+              (incf dropped excess)))
+          (when (> tail-start (max tail-size 1024))
+            (let ((live (- (fill-pointer tail) tail-start)))
+              (replace tail tail :start1 0 :start2 tail-start :end2 (fill-pointer tail))
+              (setf (fill-pointer tail) live
+                    tail-start 0)))))))
+  nil)
 
 (defmethod sink-text ((sink head-tail-buffer))
-  (%h8a-pending "sink-text head-tail-buffer"))
+  (bt2:with-lock-held ((slot-value sink 'lock))
+    (with-slots (head tail tail-start dropped) sink
+      (let ((live-tail (subseq tail tail-start (fill-pointer tail))))
+        (if (zerop dropped)
+            (concatenate 'string head live-tail)
+            (concatenate 'string head
+                         (format nil "~%[~D characters dropped]~%" dropped)
+                         live-tail))))))
 
 (defmethod sink-stats ((sink head-tail-buffer))
-  (%h8a-pending "sink-stats head-tail-buffer"))
+  (bt2:with-lock-held ((slot-value sink 'lock))
+    (values (slot-value sink 'total) (slot-value sink 'dropped))))
 
 (defmethod sink-close ((sink head-tail-buffer))
-  (%h8a-pending "sink-close head-tail-buffer"))
+  (bt2:with-lock-held ((slot-value sink 'lock))
+    (setf (slot-value sink 'closed-p) t))
+  nil)

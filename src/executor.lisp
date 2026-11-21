@@ -86,54 +86,237 @@ differs from a forced one). Unknown → NIL.")
   (declare (ignore unit handle text))
   (error 'executor-unsupported :executor executor :operation :input))
 
+;;; Internal: the supervisor tells an executor that the unit is registered (the
+;;; thread executor holds the body back until then, so units a thread starts at
+;;; once always come after it in start order).
+
+(defgeneric %executor-started (executor unit handle)
+  (:method ((executor executor) unit handle) (declare (ignore unit handle)) nil))
+
 ;;; process-executor
 
+(defclass process-unit-handle ()
+  ((process :initarg :process :reader %ph-process)
+   (pid :initarg :pid :reader %ph-pid)
+   (lock :initform (bt2:make-lock :name "process unit input"))
+   (cv :initform (bt2:make-condition-variable :name "process unit pumps"))
+   (pumps-left :initform 0)
+   (pumps :initform '())
+   (released :initform nil)))
+
+(defparameter +pump-chunk+ 4096)
+
+(defun %pump (stream sink which)
+  "Copy STREAM into SINK (as WHICH) until EOF. Chunks are written as they arrive."
+  (let ((buf (make-string +pump-chunk+)))
+    (handler-case
+        (loop
+          (let ((c (read-char stream nil :eof)))
+            (when (eq c :eof) (return))
+            (setf (char buf 0) c)
+            (let ((n 1) (eof nil))
+              (loop while (< n +pump-chunk+)
+                    do (let ((c2 (read-char-no-hang stream nil :eof)))
+                         (cond ((null c2) (return))
+                               ((eq c2 :eof) (setf eof t) (return))
+                               (t (setf (char buf n) c2) (incf n)))))
+              (sink-write sink which (subseq buf 0 n))
+              (when eof (return)))))
+      ;; The pipe went away (closed under us, decoding trouble): the pump ends.
+      (error () nil))))
+
+(defun %start-pump (handle stream sink which unit)
+  (with-slots (lock cv pumps-left pumps) handle
+    (bt2:with-lock-held (lock) (incf pumps-left))
+    (push (bt2:make-thread
+           (lambda ()
+             (unwind-protect (%pump stream sink which)
+               (bt2:with-lock-held (lock)
+                 (decf pumps-left)
+                 (bt2:condition-broadcast cv))))
+           :name (format nil "supervisor pump ~A ~(~A~)" (unit-id unit) which))
+          pumps)))
+
+(defparameter +process-external-format+
+  #+sbcl '(:utf-8 :replacement #\?)
+  #-sbcl :utf-8)
+
 (defmethod executor-launch ((executor process-executor) unit)
-  (declare (ignore unit))
-  (%h8a-pending "executor-launch process"))
+  (let* ((command (unit-command unit))
+         (backend (process-executor-backend executor))
+         (process
+           (handler-case
+               (apply #'pp:launch command
+                      :process-group t
+                      :input :stream :output :stream :error-output :stream
+                      :element-type 'character
+                      :external-format +process-external-format+
+                      (append (and (unit-cwd unit) (list :directory (unit-cwd unit)))
+                              (and (unit-env unit) (list :env (unit-env unit)))
+                              (and backend (list :backend backend))))
+             (error (e)
+               (error 'unit-start-error :supervisor (unit-supervisor unit)
+                                        :kind (unit-kind unit) :command command :cause e))))
+         (handle (make-instance 'process-unit-handle :process process :pid (pp:pid process)))
+         (sink (unit-output-sink unit)))
+    (when (pp:stdout process) (%start-pump handle (pp:stdout process) sink :stdout unit))
+    (when (pp:stderr process) (%start-pump handle (pp:stderr process) sink :stderr unit))
+    handle))
 
 (defmethod executor-pid ((executor process-executor) handle)
-  (declare (ignore handle))
-  (%h8a-pending "executor-pid process"))
+  (%ph-pid handle))
 
 (defmethod executor-pgid ((executor process-executor) handle)
-  (declare (ignore handle))
-  (%h8a-pending "executor-pgid process"))
+  (and (not (uiop:os-windows-p)) (%ph-pid handle)))
+
+(defun %kill-process-tree (process force)
+  "PP:KILL :TREE T; a handle without a group falls back to the direct child."
+  (handler-bind ((pp:process-group-error
+                   (lambda (c) (let ((r (find-restart 'continue c))) (when r (invoke-restart r))))))
+    (pp:kill process :tree t :force force)))
 
 (defmethod executor-stop ((executor process-executor) unit handle &key force)
-  (declare (ignore unit handle force))
-  (%h8a-pending "executor-stop process"))
+  (declare (ignore unit))
+  (%kill-process-tree (%ph-process handle) force)
+  t)
 
 (defmethod executor-wait ((executor process-executor) unit handle &key timeout)
-  (declare (ignore unit handle timeout))
-  (%h8a-pending "executor-wait process"))
+  (declare (ignore unit))
+  (let ((process (%ph-process handle)))
+    (if timeout
+        (handler-case (values t (pp:wait process :timeout timeout) nil nil)
+          (pp:process-timeout-error () (values nil)))
+        ;; No limit: short bounded waits in a loop (the backend polls the child),
+        ;; so the end is seen within a fraction of a second.
+        (loop
+          (handler-case (return (values t (pp:wait process :timeout 0.5) nil nil))
+            (pp:process-timeout-error () nil))))))
 
 (defmethod executor-alive-p ((executor process-executor) unit handle)
-  (declare (ignore unit handle))
-  (%h8a-pending "executor-alive-p process"))
+  (declare (ignore unit))
+  (pp:alive-p (%ph-process handle)))
 
 (defmethod executor-send-input ((executor process-executor) unit handle text)
-  (declare (ignore unit handle text))
-  (%h8a-pending "executor-send-input process"))
+  (let ((stdin (pp:stdin (%ph-process handle))))
+    (unless stdin
+      (error 'unit-not-running :supervisor (unit-supervisor unit) :unit unit))
+    (handler-case
+        (bt2:with-lock-held ((slot-value handle 'lock))
+          (write-string text stdin)
+          (finish-output stdin))
+      (stream-error ()
+        (error 'unit-not-running :supervisor (unit-supervisor unit) :unit unit
+                                 :message "its stdin is closed")))
+    t))
+
+(defparameter +pump-join-timeout+ 3
+  "Seconds EXECUTOR-RELEASE waits for the pumps to reach EOF after the tree kill.")
 
 (defmethod executor-release ((executor process-executor) unit handle)
-  (declare (ignore unit handle))
-  (%h8a-pending "executor-release process"))
+  (declare (ignore unit))
+  (let ((process (%ph-process handle)))
+    (with-slots (lock cv pumps-left pumps released) handle
+      (unless (bt2:with-lock-held (lock) (shiftf released t))
+        ;; Whatever is left of the tree (grandchildren in the group / job) dies too.
+        (ignore-errors (%kill-process-tree process t))
+        ;; The pumps see EOF once every holder of the pipes is gone.
+        (let ((deadline (+ (%now) +pump-join-timeout+)))
+          (bt2:with-lock-held (lock)
+            (loop while (and (plusp pumps-left) (< (%now) deadline))
+                  do (bt2:condition-wait cv lock :timeout (max 0.01 (- deadline (%now)))))))
+        (dolist (s (list (pp:stdin process) (pp:stdout process) (pp:stderr process)))
+          (when s (ignore-errors (close s :abort t))))
+        (dolist (th pumps)
+          (unless (bt2:thread-alive-p th)
+            (ignore-errors (bt2:join-thread th)))))))
+  nil)
 
 ;;; thread-executor
 
+(defclass thread-unit-handle ()
+  ((thread :initform nil :accessor %th-thread)
+   (lock :initform (bt2:make-lock :name "thread unit"))
+   (cv :initform (bt2:make-condition-variable :name "thread unit"))
+   (go-p :initform nil)
+   (done :initform nil)
+   (forced :initform nil)
+   (condition :initform nil)
+   (result :initform nil)
+   (in-body :initform nil)
+   (deferred :initform (list nil) :documentation "*DEFERRED-STOP* cell of the thread.")))
+
+(defun %thread-body (handle unit)
+  (with-slots (lock cv go-p done forced condition result in-body deferred) handle
+    (let ((*current-unit* unit)
+          (*current-scope* (unit-owner unit))
+          (*deferred-stop* deferred))
+      (unwind-protect
+           (when (eq :forced
+                     (catch handle
+                       ;; Wait until the supervisor registered the unit.
+                       (bt2:with-lock-held (lock)
+                         (loop until go-p do (bt2:condition-wait cv lock :timeout 1)))
+                       (setf in-body t)
+                       (handler-case (setf result (funcall (unit-function unit) unit))
+                         (error (e) (setf condition e)))
+                       (setf in-body nil)
+                       nil))
+             (setf forced t))
+        (setf in-body nil)
+        (bt2:with-lock-held (lock)
+          (setf done t)
+          (bt2:condition-broadcast cv))))))
+
 (defmethod executor-launch ((executor thread-executor) unit)
+  (unless (functionp (unit-function unit))
+    (error 'unit-start-error :supervisor (unit-supervisor unit) :kind (unit-kind unit)
+                             :message "the thread executor needs a :function"))
+  (let ((handle (make-instance 'thread-unit-handle)))
+    (setf (%th-thread handle)
+          (bt2:make-thread (lambda () (%thread-body handle unit))
+                           :name (format nil "supervisor unit ~A" (unit-id unit))))
+    handle))
+
+(defmethod %executor-started ((executor thread-executor) unit handle)
   (declare (ignore unit))
-  (%h8a-pending "executor-launch thread"))
+  (bt2:with-lock-held ((slot-value handle 'lock))
+    (setf (slot-value handle 'go-p) t)
+    (bt2:condition-broadcast (slot-value handle 'cv)))
+  nil)
 
 (defmethod executor-stop ((executor thread-executor) unit handle &key force)
-  (declare (ignore unit handle force))
-  (%h8a-pending "executor-stop thread"))
+  (declare (ignore unit))
+  ;; Graceful: cooperative (the supervisor set UNIT-STOP-REQUESTED-P).
+  (when force
+    (let ((thread (%th-thread handle)))
+      (when (and thread (bt2:thread-alive-p thread)
+                 (not (slot-value handle 'done)))
+        ;; The thread may end between the check and the interrupt.
+        (ignore-errors
+         (bt2:interrupt-thread
+          thread
+          (lambda ()
+            (when (slot-value handle 'in-body)
+              (if *in-critical*
+                  (setf (car (slot-value handle 'deferred)) handle)
+                  (throw handle :forced)))))))))
+  t)
 
 (defmethod executor-wait ((executor thread-executor) unit handle &key timeout)
-  (declare (ignore unit handle timeout))
-  (%h8a-pending "executor-wait thread"))
+  (declare (ignore unit))
+  (with-slots (lock cv done forced condition result) handle
+    (let ((deadline (and timeout (+ (%now) timeout))))
+      (bt2:with-lock-held (lock)
+        (loop until done
+              do (if deadline
+                     (let ((left (- deadline (%now))))
+                       (when (<= left 0) (return-from executor-wait (values nil)))
+                       (bt2:condition-wait cv lock :timeout left))
+                     (bt2:condition-wait cv lock))))
+      (if forced
+          (values t nil nil nil)
+          (values t nil condition result)))))
 
 (defmethod executor-alive-p ((executor thread-executor) unit handle)
-  (declare (ignore unit handle))
-  (%h8a-pending "executor-alive-p thread"))
+  (declare (ignore unit))
+  (not (slot-value handle 'done)))

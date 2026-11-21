@@ -1,9 +1,5 @@
 (in-package #:supervisor-protocol)
 
-;;; Contract stub. The implementation replaces every call and deletes it.
-(defun %h8a-pending (what)
-  (error "supervisor-protocol H8a: ~A is not implemented yet" what))
-
 ;;; ------------------------------------------------------------------
 ;;; Constants
 
@@ -42,6 +38,46 @@ inside a thread unit (to the unit's owner).")
   "Bound to the unit inside a thread unit's function.")
 
 ;;; ------------------------------------------------------------------
+;;; Internal: clock and the supervisor lock
+
+(declaim (inline %now))
+(defun %now ()
+  "Seconds on the image's monotonic clock (a double)."
+  (/ (float (get-internal-real-time) 1d0) internal-time-units-per-second))
+
+(defvar *in-critical* nil
+  "True while this thread holds a supervisor lock: a forced stop of a thread unit
+is deferred until the lock is released (see %RUN-DEFERRED-STOP).")
+
+(defvar *deferred-stop* nil
+  "Inside a thread unit: a cons whose car is the catch tag a deferred forced stop
+throws to, or NIL.")
+
+(defun %run-deferred-stop ()
+  (when (and (not *in-critical*) *deferred-stop* (car *deferred-stop*))
+    (let ((tag (car *deferred-stop*)))
+      (setf (car *deferred-stop*) nil)
+      (throw tag :forced))))
+
+(defmacro %with-lock ((supervisor) &body body)
+  "BODY with SUPERVISOR's lock held. Never call user code inside."
+  `(unwind-protect
+        (let ((*in-critical* t))
+          (bt2:with-lock-held ((slot-value ,supervisor 'lock)) ,@body))
+     (%run-deferred-stop)))
+
+(defun %cv-wait (supervisor timeout)
+  "Wait on SUPERVISOR's state cv (lock held), at most TIMEOUT seconds (NIL: no limit).
+A forced stop of this thread may unwind from here."
+  (let ((*in-critical* nil))
+    (%run-deferred-stop)
+    (bt2:condition-wait (slot-value supervisor 'cv) (slot-value supervisor 'lock)
+                        :timeout (and timeout (max timeout 0.001)))))
+
+(defun %broadcast (supervisor)
+  (bt2:condition-broadcast (slot-value supervisor 'cv)))
+
+;;; ------------------------------------------------------------------
 ;;; Restart policy
 
 (defgeneric kind-default-restart (kind)
@@ -54,8 +90,8 @@ inside a thread unit (to the unit's owner).")
 (defun restart-delay (backoff attempt)
   "Seconds before restart ATTEMPT (1, 2, …) under BACKOFF = (initial factor max):
 min(max, initial × factor^(attempt − 1))."
-  (declare (ignore backoff attempt))
-  (%h8a-pending "restart-delay"))
+  (destructuring-bind (initial factor max) backoff
+    (min max (* initial (expt factor (1- attempt))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Supervisor
@@ -84,7 +120,22 @@ min(max, initial × factor^(attempt − 1))."
               :documentation "The function registered as image exit hook, or NIL.")
    (process-executor :initarg :process-executor :initform nil)
    (thread-executor :initarg :thread-executor :initform nil)
-   (lock :initform (bt2:make-lock :name "supervisor"))))
+   (lock :initform (bt2:make-lock :name "supervisor"))
+   ;; internal state, all guarded by LOCK
+   (cv :initform (bt2:make-condition-variable :name "supervisor state"))
+   (units :initform '() :documentation "Registry, newest first.")
+   (by-id :initform (make-hash-table :test 'equal))
+   (kind-counters :initform (make-hash-table :test 'eq))
+   (tick :initform 0 :documentation "LRU clock, strictly increasing.")
+   (seq :initform 0 :documentation "Seq of the newest event.")
+   (event-log :initform nil :documentation "Ring of the retained events.")
+   (queue-head :initform '() :documentation "Dispatcher FIFO (events and replays).")
+   (queue-tail :initform '())
+   (subscriptions :initform '())
+   (dispatcher :initform nil)
+   (dispatch-closing :initform nil)
+   (dispatch-done :initform nil)
+   (os-start :initform nil :documentation "This image's OS start string (lazy).")))
 
 ;;; ------------------------------------------------------------------
 ;;; Scopes
@@ -146,7 +197,10 @@ min(max, initial × factor^(attempt − 1))."
    (supervisor :initarg :supervisor :reader unit-supervisor)
    (output-sink :initform nil :reader unit-output-sink)
    (file-path :initform nil :reader unit-file-path
-              :documentation "Its unit file while one exists, else NIL.")))
+              :documentation "Its unit file while one exists, else NIL.")
+   ;; internal
+   (gen :initform 0 :documentation "Launch generation: a waiter publishes only for the current one.")
+   (abandoned-p :initform nil)))
 
 (defun unit-live-p (unit)
   (and (member (unit-state unit) +live-states+) t))
