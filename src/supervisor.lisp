@@ -371,15 +371,31 @@ cap-owner evicted): VERDICT :OK or :FULL."
                              (event-capacity +default-event-capacity+)
                              (output-sink-factory 'default-output-sink)
                              (process-executor (make-process-executor))
-                             (thread-executor (make-thread-executor)))
+                             (thread-executor (make-thread-executor))
+                             (log t)
+                             (log-segment-size +default-log-segment-size+)
+                             (log-segments +default-log-segments+)
+                             (log-total-cap +default-log-total-cap+)
+                             (log-max-record +default-log-max-record+)
+                             log-error-handler)
   "A new supervisor with its root scope (kind :SUPERVISOR). With STATE-DIRECTORY
 (created if missing) process units get unit files, and with SWEEP the orphan
 sweep runs first (SUPERVISOR-SWEEP-REPORT). EXIT-HOOK registers a function that
 shuts the supervisor down when the image exits normally (SBCL
 SB-EXT:*EXIT-HOOKS*; elsewhere UIOP:REGISTER-IMAGE-EXIT-HOOK); on exit an
 unhandled STOP-TIMEOUT forces and STOP-FAILED abandons. KIND-CAPS: plist kind →
-limit. OWNER-CAP: limit per directly owning scope."
+limit. OWNER-CAP: limit per directly owning scope.
+H8b: with STATE-DIRECTORY and LOG, every unit's stdout / stderr goes to rotated
+segment files under <state-directory>/units/<supervisor-id>--<unit-id>/ (see
+DEFAULT-OUTPUT-SINK): LOG-SEGMENT-SIZE bytes × LOG-SEGMENTS per unit, LOG-MAX-RECORD
+output octets per record, LOG-TOTAL-CAP bytes for all of this supervisor's logs.
+LOG-ERROR-HANDLER: a function of a LOG-WRITE-ERROR, called when the dynamic
+handlers declined; it may invoke RETRY, DROP-TO-MEMORY-ONLY or ABORT-UNIT."
   (check-type event-capacity (integer 0))
+  (check-type log-segment-size (integer 1))
+  (check-type log-segments (integer 1))
+  (check-type log-total-cap (integer 0))
+  (check-type log-max-record (integer 1))
   (let* ((dir (and state-directory (uiop:ensure-directory-pathname state-directory)))
          (id (format nil "~D-~(~8,'0x~)" (current-pid)
                      (random #x100000000 (make-random-state t))))
@@ -389,7 +405,11 @@ limit. OWNER-CAP: limit per directly owning scope."
                                          :event-capacity event-capacity
                                          :output-sink-factory output-sink-factory
                                          :process-executor process-executor
-                                         :thread-executor thread-executor)))
+                                         :thread-executor thread-executor
+                                         :log log :log-segment-size log-segment-size
+                                         :log-segments log-segments :log-total-cap log-total-cap
+                                         :log-max-record log-max-record
+                                         :log-error-handler log-error-handler)))
     (setf (slot-value sup 'root-scope)
           (make-instance 'scope :supervisor sup :kind :supervisor :name (supervisor-id sup)))
     (when dir
@@ -505,7 +525,8 @@ scope → SUPERVISOR-ERROR (use SHUTDOWN-SUPERVISOR)."
 ;;; Units
 
 (defun start-unit (supervisor kind &key command function owner labels cwd env executor
-                                        restart max-restarts backoff interacting)
+                                        restart max-restarts backoff interacting
+                                        (log t) log-segment-size log-segments)
   "Register and launch a unit. → the UNIT (state :RUNNING), or NIL when the ABORT
 restart was taken.
 KIND: a keyword (open set: :SHELL-JOB :LSP :RPC :IMAGE :PTY :SUBAGENT …).
@@ -517,6 +538,8 @@ PROCESS-PROTOCOL:LAUNCH :DIRECTORY / :ENV.
 RESTART :NEVER | :ON-FAILURE (default KIND-DEFAULT-RESTART), MAX-RESTARTS
 (default +DEFAULT-MAX-RESTARTS+), BACKOFF (initial factor max), default
 +DEFAULT-BACKOFF+. INTERACTING: the initial UNIT-INTERACTING-P.
+H8b: LOG NIL keeps this unit's output in memory only; LOG-SEGMENT-SIZE and
+LOG-SEGMENTS override the supervisor's (UNIT-LOG-SETTINGS has the effective ones).
 Caps (SUPERVISOR-KIND-CAPS, SUPERVISOR-OWNER-CAP) count retained units, any state.
 At a cap the least recently used finished unit is evicted silently; with none,
 UNIT-LIMIT-REACHED is signalled (ERROR) with restarts EVICT-LRU (offered when a
@@ -574,7 +597,14 @@ SCOPE-CLOSED. Shut-down supervisor → SUPERVISOR-CLOSED."
                                          :max-restarts (or max-restarts +default-max-restarts+)
                                          :backoff (or backoff +default-backoff+)
                                          :interacting interacting
-                                         :executor exec :supervisor sup)))
+                                         :executor exec :supervisor sup
+                                         :log-settings
+                                         (list :enabled (and log (supervisor-log-p sup)
+                                                             (supervisor-state-directory sup) t)
+                                               :segment-size (or log-segment-size
+                                                                 (supervisor-log-segment-size sup))
+                                               :segments (or log-segments
+                                                             (supervisor-log-segments sup))))))
           (flet ((roll-back ()
                    (%with-lock (sup)
                      (when (eql n (gethash kind (slot-value sup 'kind-counters)))
@@ -705,3 +735,15 @@ is NIL). LABELS: a plist; each pair must be in UNIT-LABELS (EQUAL values)."
                         (or (null labels) (%labels-match-p u labels))))
                  (supervisor-units supervisor)))
 
+;;; ------------------------------------------------------------------
+;;; H8b: the supervisor's log accounting
+
+(defun supervisor-log-usage (supervisor)
+  "Bytes of segment and index files of every unit log this supervisor wrote (units
+evicted from the registry included; segments a Windows reader still holds open
+count until they are gone). The total cap (SUPERVISOR-LOG-TOTAL-CAP) evicts, after
+each rotation and each finished unit, while this is over it: first the segments of
+the finished unit that finished earliest (oldest segment first; its newest becomes
+a stub), then the oldest segment of a live unit that is not that unit's newest."
+  (declare (ignore supervisor))
+  (%h8b-pending "supervisor-log-usage"))

@@ -1,11 +1,14 @@
 (in-package #:supervisor-protocol)
 
 ;;; Output sinks. Every unit has one, made by the supervisor's
-;;; OUTPUT-SINK-FACTORY before launch. Process units: the executor pumps
-;;; stdout and stderr into it (STREAM :STDOUT / :STDERR, text decoded as
-;;; UTF-8). Thread units: the body calls SINK-WRITE itself. The default keeps
-;;; a head and a tail in memory; H8b replaces the factory with rotated,
-;;; size-capped log files and keeps this buffer for the in-memory view.
+;;; OUTPUT-SINK-FACTORY before launch. Process units (H8b): the executor
+;;; launches with octet pipes and pumps stdout and stderr into the sink with
+;;; SINK-WRITE-OCTETS (STREAM :STDOUT / :STDERR, the exact bytes). Thread units
+;;; (H8b): *STANDARD-OUTPUT* and *ERROR-OUTPUT* are bound to SINK-OUTPUT-STREAMs
+;;; that SINK-WRITE into the sink; the body may also call SINK-WRITE itself.
+;;; DEFAULT-OUTPUT-SINK makes a LOG-SINK (rotated segment files, src/log-sink.lisp,
+;;; itself a HEAD-TAIL-BUFFER for the in-memory view) when the unit logs, and a
+;;; plain HEAD-TAIL-BUFFER otherwise.
 
 (defclass output-sink () ()
   (:documentation "Where a unit's output goes. Methods must be thread-safe."))
@@ -18,6 +21,17 @@
 dropped; otherwise the first HEAD-SIZE characters, then
   (format nil \"~%[~D characters dropped]~%\" dropped)
 then the last TAIL-SIZE characters. Streams are interleaved in arrival order."))
+
+(defgeneric sink-write-octets (sink stream octets &key start end)
+  (:documentation "H8b. Append the OCTETS [START, END) — raw bytes that arrived on STREAM
+(:STDOUT or :STDERR) — to SINK. → NIL. The default method (any OUTPUT-SINK)
+decodes UTF-8 incrementally per stream (an incomplete sequence at the end is kept
+for that stream's next call; invalid bytes become U+FFFD) and calls SINK-WRITE
+with the text, so 0.1.0 sinks keep working. LOG-SINK stores the exact bytes."))
+
+(defmethod sink-write-octets ((sink output-sink) stream octets &key (start 0) end)
+  (declare (ignore stream octets start end))
+  (%h8b-pending "sink-write-octets output-sink"))
 
 (defgeneric sink-stats (sink)
   (:documentation "→ (values total-characters dropped-characters)."))
@@ -46,7 +60,13 @@ ignored; SINK-TEXT still answers. Idempotent. → NIL.")
   (make-instance 'head-tail-buffer :head-size head-size :tail-size tail-size))
 
 (defun default-output-sink (unit)
-  "The default OUTPUT-SINK-FACTORY: a HEAD-TAIL-BUFFER with the default sizes."
+  "The default OUTPUT-SINK-FACTORY. H8b: when (GETF (UNIT-LOG-SETTINGS UNIT) :ENABLED)
+— the supervisor has a state directory, SUPERVISOR-LOG-P, and START-UNIT got no
+:LOG NIL — a LOG-SINK in (UNIT-LOG-PATHNAME state-directory supervisor-id unit-id)
+with the unit's :SEGMENT-SIZE / :SEGMENTS, the supervisor's LOG-MAX-RECORD and the
+default head / tail sizes; otherwise a HEAD-TAIL-BUFFER with the default sizes."
+  ;; H8b contract: still the 0.1.0 behaviour; the implementation makes the
+  ;; LOG-SINK described above.
   (declare (ignore unit))
   (make-head-tail-buffer))
 

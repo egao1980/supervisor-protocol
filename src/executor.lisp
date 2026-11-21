@@ -8,6 +8,16 @@
 ;;; The supervisor calls EXECUTOR-WAIT with no timeout on a thread of its own
 ;;; per launch, and publishes the unit's final state from there, so a state
 ;;; never stays :RUNNING after the work ended (no caller needs to poll).
+;;;
+;;; H8b: the process executor launches with :ELEMENT-TYPE :OCTETS (all three
+;;; pipes), its pumps hand each chunk to SINK-WRITE-OCTETS unchanged (no
+;;; decoding: binary output reaches the sink byte for byte; a chunk is what one
+;;; read returned, at most +PUMP-CHUNK+ octets), and EXECUTOR-SEND-INPUT writes
+;;; TEXT encoded as UTF-8. The thread executor binds *STANDARD-OUTPUT* and
+;;; *ERROR-OUTPUT* to SINK-OUTPUT-STREAMs of the unit's sink (:STDOUT / :STDERR)
+;;; around the body and flushes them however the body ends. A LOG-WRITE-ERROR
+;;; is signalled on the writing thread (a pump, or the unit's own thread), so a
+;;; body's own HANDLER-BIND sees it first (see src/conditions.lisp).
 
 (defclass executor () ())
 

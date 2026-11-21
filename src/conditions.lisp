@@ -3,7 +3,7 @@
 ;;; CLHS 9. SUPERVISOR-CONDITION is the root; SUPERVISOR-ERROR the errors.
 ;;; STOP-TIMEOUT is not an error: it is SIGNALled and, unhandled, the stop
 ;;; escalates (FORCE). Restart names: EVICT-LRU, CL:ABORT, FORCE, KEEP-WAITING,
-;;; ABANDON.
+;;; ABANDON; H8b adds RETRY, DROP-TO-MEMORY-ONLY, ABORT-UNIT.
 
 (define-condition supervisor-condition (condition)
   ((supervisor :initarg :supervisor :initform nil :reader supervisor-condition-supervisor)))
@@ -89,3 +89,33 @@
   (:report (lambda (c s)
              (format s "Unreadable unit file ~A~@[: ~A~]"
                      (unit-file-unreadable-path c) (unit-file-unreadable-cause c)))))
+
+;;; H8b. LOG-WRITE-ERROR is SIGNALled (not ERRORed) by a log sink on the thread
+;;; that wrote (a pump thread, or a thread unit's own thread), inside
+;;; RESTART-CASE with RETRY (reopen the segment and write the record again),
+;;; DROP-TO-MEMORY-ONLY (no more files for this unit; the head + tail buffer
+;;; keeps going) and, when the sink has a unit, ABORT-UNIT (request a forced
+;;; stop without waiting; the unit ends :KILLED). The sink SIGNALs it, so the
+;;; dynamic handlers of the writing thread see it first; when they decline, the
+;;; sink calls the supervisor's LOG-ERROR-HANDLER (if any) with it, inside the
+;;; same RESTART-CASE; when that returns too: DROP-TO-MEMORY-ONLY. Every
+;;; outcome publishes one :LOG-ERROR event (sinks with a unit). The unit is
+;;; never stopped unless ABORT-UNIT is chosen.
+
+(define-condition log-write-error (supervisor-error)
+  ((sink :initarg :sink :initform nil :reader log-write-error-sink)
+   (unit :initarg :unit :initform nil :reader log-write-error-unit)
+   (path :initarg :path :initform nil :reader log-write-error-path)
+   (cause :initarg :cause :initform nil :reader log-write-error-cause))
+  (:report (lambda (c s)
+             (format s "Cannot write unit log~@[ ~A~]~@[ of ~A~]~@[: ~A~]"
+                     (let ((p (log-write-error-path c))) (and p (uiop:native-namestring p)))
+                     (let ((u (log-write-error-unit c))) (and u (unit-id u)))
+                     (log-write-error-cause c)))))
+
+(define-condition log-not-found (supervisor-error)
+  ((path :initarg :path :initform nil :reader log-not-found-path))
+  (:report (lambda (c s)
+             (format s "No unit log~@[ at ~A~]~@[: ~A~]"
+                     (let ((p (log-not-found-path c))) (and p (uiop:native-namestring p)))
+                     (supervisor-error-message c)))))
