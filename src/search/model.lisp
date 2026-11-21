@@ -1,8 +1,5 @@
 (in-package #:supervisor-protocol/search)
 
-(defun %h8c-pending (what)
-  (error "supervisor-protocol/search H8c: ~A is not implemented yet" what))
-
 ;;; ------------------------------------------------------------------
 ;;; Constants
 
@@ -74,7 +71,18 @@ index keeps that segment in memory and carries on.")
    (kind-boost :initarg :kind-boost :initform +default-kind-boost+ :reader index-kind-boost)
    (embedder :initarg :embedder :initform nil :reader index-embedder)
    (closed :initform nil :reader index-closed-p)
-   (lock :initform (bt2:make-lock :name "log-index")))
+   (lock :initform (bt2:make-lock :name "log-index"))
+   ;; internal state, guarded by LOCK (src/search/index.lisp)
+   (logs :initform (make-hash-table :test 'equal) :documentation "Key → %ILOG.")
+   (by-dir :initform (make-hash-table :test 'equal) :documentation "Directory namestring → key.")
+   (removed :initform (make-hash-table :test 'equal)
+            :documentation "Directories INDEX-REMOVE-LOG took out of discovery.")
+   (own-order :initform '() :documentation "The supervisor's keys, unit start order first.")
+   (terms :initform (make-hash-table :test 'equal) :documentation "Term interning.")
+   (tokenized :initform 0)
+   (loaded :initform 0)
+   (written :initform 0)
+   (rebuilt :initform 0))
   (:documentation "An incremental index over unit logs. See MAKE-LOG-INDEX."))
 
 (defmethod print-object ((index log-index) stream)

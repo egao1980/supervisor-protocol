@@ -115,7 +115,7 @@ image goes memory-only first. → T."))
 ;;; ------------------------------------------------------------------
 ;;; Designators
 
-(declaim (ftype function %forget-log %find-live-log-sink))
+(declaim (ftype function %forget-log %find-live-log-sink %segment-output-bytes %dropped-through))
 
 (defun %log-ids (directory)
   "(values supervisor-id unit-id) from the directory name <supervisor-id>--<unit-id>."
@@ -338,6 +338,28 @@ first + k × stride (up to the first one that is missing)."
   (let ((segs (%scan-log (unit-log-directory log))))
     (when maintain (%maintain-indexes log segs))
     segs))
+
+;;; H8c: what a reopened sink continues from (see %LOG-SINK-REOPEN).
+
+(defun %log-resume-state (dir)
+  "→ (values newest-segment-number next-line retained-%segs dropped-through
+dropped-records dropped-bytes) of the log in DIR as it is on disk."
+  (let ((segs (%scan-log dir)))
+    (flet ((last-line (s)
+             (let ((r (%rs-records s)))
+               (if (plusp (length r)) (log-record-line (svref r (1- (length r)))) 0))))
+      (multiple-value-bind (records bytes) (%prefix-drops segs)
+        (values (if segs (%rs-number (car (last segs))) 0)
+                (1+ (reduce #'max (mapcar #'last-line segs) :initial-value 0))
+                (mapcar (lambda (s)
+                          (make-%seg :number (%rs-number s)
+                                     :first-line (or (%segment-first-line s) (last-line s))
+                                     :last-line (last-line s)
+                                     :records (length (%rs-records s))
+                                     :output-bytes (%segment-output-bytes s)))
+                        segs)
+                (%dropped-through segs)
+                records bytes)))))
 
 ;;; Gaps
 

@@ -1,8 +1,5 @@
 (in-package #:supervisor-protocol)
 
-(defun %h8c-pending (what)
-  (error "supervisor-protocol H8c: ~A is not implemented yet" what))
-
 ;;; ------------------------------------------------------------------
 ;;; Constants
 
@@ -248,7 +245,9 @@ min(max, initial × factor^(attempt − 1))."
               :documentation "Its unit file while one exists, else NIL.")
    ;; internal
    (gen :initform 0 :documentation "Launch generation: a waiter publishes only for the current one.")
-   (abandoned-p :initform nil)))
+   (abandoned-p :initform nil)
+   (waiter :initform nil :documentation "H8c: the waiter thread of the current launch.")
+   (restarting-p :initform nil :documentation "H8c: RESTART-UNIT is relaunching the unit.")))
 
 (defun unit-live-p (unit)
   (and (member (unit-state unit) +live-states+) t))
