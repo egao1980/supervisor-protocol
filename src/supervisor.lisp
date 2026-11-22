@@ -441,7 +441,7 @@ R4d-0: COMPUTE-EXECUTOR (a COMPUTE-EXECUTOR, or NIL) runs START-UNIT :CONFINEMEN
 
 (defun shutdown-supervisor (supervisor &key grace force-grace)
   "Stop every live unit (one stop wave, see STOP-UNITS), delete the unit files,
-stop event delivery (subscriptions become inactive), remove the exit hook. Later
+close the logs of finished units (their files stay), stop event delivery (subscriptions become inactive), remove the exit hook. Later
 START-UNIT / MAKE-SCOPE → SUPERVISOR-CLOSED; queries still answer. Idempotent. → NIL."
   (unless (%with-lock (supervisor)
             (unless (supervisor-closed-p supervisor)
@@ -458,7 +458,13 @@ START-UNIT / MAKE-SCOPE → SUPERVISOR-CLOSED; queries still answer. Idempotent.
         (dolist (s (%scope-subtree (supervisor-root-scope supervisor)))
           (setf (slot-value s 'closed-p) t)))
       (dolist (u units)
-        (unless (slot-value u 'abandoned-p) (%delete-unit-file u))))
+        (unless (slot-value u 'abandoned-p) (%delete-unit-file u)))
+      ;; A unit is finished (the stop wave saw it) before its watcher closes
+      ;; its sink, outside the lock: close every finished unit's log here, so
+      ;; no segment or index is still open when shutdown returns (Windows
+      ;; cannot delete an open file). Idempotent; the watcher's close is a no-op.
+      (dolist (u units)
+        (unless (unit-live-p u) (%sink-close-quietly u))))
     ;; Logs stay; deletes a Windows reader held up are retried once more.
     (ignore-errors (%retry-supervisor-log-deletes supervisor))
     (%stop-dispatcher supervisor)

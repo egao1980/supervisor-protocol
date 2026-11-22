@@ -53,3 +53,38 @@
                  (ok (null (units-dir-files state)))))
           (kill-pids-quietly pids-seen)
           (ignore-errors (pp:kill (child-handle child) :force t)))))))
+
+(deftest shutdown-closes-the-logs-of-finished-units
+  ;; cl-stack-code (Windows): a thread unit finished just before shutdown; its
+  ;; watcher had not closed the sink yet (that runs outside the lock, after the
+  ;; state change the stop wave waits for), so shutdown returned with
+  ;; 00000001.idx open and deleting the state directory failed.
+  (with-temp-dir (dir)
+    (let* ((sym 'supervisor-protocol::%after-finish)
+           (orig (fdefinition sym))
+           (gate (list nil))
+           (sup (make-supervisor :exit-hook nil :state-directory dir)))
+      (setf (fdefinition sym) (lambda (u) (sleep 1) (funcall orig u)))
+      (unwind-protect
+           (let ((units (loop repeat 3
+                              collect (start-unit sup :subagent
+                                                  :function (lambda (u)
+                                                              (declare (ignore u))
+                                                              (write-line "hi")
+                                                              (finish-output)
+                                                              (loop until (car gate) do (sleep 0.01)))))))
+             (setf (car gate) t)
+             (shutdown-supervisor sup :grace 3)
+             (ok (every (lambda (u)
+                          (let ((sink (unit-output-sink u)))
+                            (and (typep sink 'log-sink)
+                                 (slot-value sink 'supervisor-protocol::log-closed-p)
+                                 (null (slot-value sink 'supervisor-protocol::idx-stream))
+                                 (null (slot-value sink 'supervisor-protocol::seg-stream)))))
+                        units)
+                 "every finished unit's segment and index are closed when shutdown returns"))
+        (setf (fdefinition sym) orig)
+        (setf (car gate) t)
+        (%quiet-shutdown sup)
+        ;; the delayed watchers finish before the directory goes
+        (sleep 1.5)))))
