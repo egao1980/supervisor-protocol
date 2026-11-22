@@ -12,6 +12,12 @@
 (defparameter +live-states+ '(:starting :running))
 (defparameter +final-states+ '(:exited :killed :failed))
 
+(defparameter +unit-stdio-modes+ '(:log :channel)
+  "0.5.0, START-UNIT :STDIO. :LOG (default): stdout and stderr go to the unit log,
+stdin is fed by SEND-UNIT-INPUT. :CHANNEL: stdin and stdout are the caller's
+(UNIT-CHANNEL-STREAMS, character streams, UTF-8), for a protocol peer such as a
+JSON-RPC, MCP or LSP server; stderr alone goes to the unit log.")
+
 (defparameter +event-types+ '(:state :restart-scheduled :evicted :log-error)
   ":STATE a state change (FROM → TO; FROM is NIL for the first event of a unit);
 :RESTART-SCHEDULED a :FAILED unit will relaunch (detail :ATTEMPT :DELAY);
@@ -219,6 +225,10 @@ min(max, initial × factor^(attempt − 1))."
    (env :initarg :env :initform nil :reader unit-env)
    (confinement :initarg :confinement :initform nil :reader unit-confinement
                 :documentation "R4d-0: the STACK-COMPUTE:CONFINEMENT the unit runs under, or NIL.")
+   (stdio :initarg :stdio :initform :log :reader unit-stdio
+          :documentation "0.5.0: :LOG (stdout and stderr pumped into the unit log, stdin through
+SEND-UNIT-INPUT) or :CHANNEL (stdin and stdout belong to the caller, see
+UNIT-CHANNEL-STREAMS; only stderr reaches the log).")
    (pid :initform nil :reader unit-pid)
    (pgid :initform nil :reader unit-pgid)
    (start-time :initform nil :reader unit-start-time :documentation "Universal time of the last launch.")
@@ -255,6 +265,10 @@ min(max, initial × factor^(attempt − 1))."
 
 (defun unit-live-p (unit)
   (and (member (unit-state unit) +live-states+) t))
+
+(defun unit-channel-p (unit)
+  "0.5.0: UNIT was started with :STDIO :CHANNEL."
+  (eq (unit-stdio unit) :channel))
 
 (defun unit-finished-p (unit)
   "Final state and no restart pending."

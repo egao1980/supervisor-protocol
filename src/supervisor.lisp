@@ -544,7 +544,8 @@ scope → SUPERVISOR-ERROR (use SHUTDOWN-SUPERVISOR)."
 
 (defun start-unit (supervisor kind &key command function owner labels cwd env executor
                                         restart max-restarts backoff interacting
-                                        (log t) log-segment-size log-segments confinement)
+                                        (log t) log-segment-size log-segments confinement
+                                        (stdio :log))
   "Register and launch a unit. → the UNIT (state :RUNNING), or NIL when the ABORT
 restart was taken.
 KIND: a keyword (open set: :SHELL-JOB :LSP :RPC :IMAGE :PTY :SUBAGENT …).
@@ -564,6 +565,19 @@ given without CONFINEMENT uses COMPUTE-EXECUTOR-CONFINEMENT. No compute executor
 confinement for one, a FUNCTION, or another :EXECUTOR → UNIT-START-ERROR; a
 confinement the backend refuses → UNIT-START-ERROR whose cause is the compute
 condition (CONFINEMENT-UNSUPPORTED, CONFINEMENT-UNAVAILABLE, INVALID-CONFINEMENT).
+STDIO (0.5.0) :LOG (default) or :CHANNEL: stdin and stdout are handed to the caller
+(UNIT-CHANNEL-STREAMS), only stderr goes to the unit log; SEND-UNIT-INPUT,
+CLOSE-UNIT-INPUT and RESTART-UNIT signal CHANNEL-UNIT-ERROR. A channel unit runs once:
+RESTART defaults to :NEVER and :ON-FAILURE is refused (a restarted peer lost its
+protocol session; start a new unit). It needs an executor with :CHANNEL (process and
+compute executors). Another STDIO, a FUNCTION, or :ON-FAILURE → UNIT-START-ERROR.
+STDIO (0.5.0): :LOG (default) or :CHANNEL. A channel unit's stdin and stdout belong to
+the caller (UNIT-CHANNEL-STREAMS: character streams, UTF-8); only its stderr goes to
+the unit log. SEND-UNIT-INPUT, CLOSE-UNIT-INPUT and RESTART-UNIT on it signal
+CHANNEL-UNIT-ERROR. It runs once: RESTART defaults to :NEVER, and :ON-FAILURE is
+refused (a restarted peer lost its protocol session; start a new unit instead). It
+needs an executor that supports :CHANNEL (the process and compute executors). Another
+STDIO value, a FUNCTION, or :ON-FAILURE → UNIT-START-ERROR.
 Caps (SUPERVISOR-KIND-CAPS, SUPERVISOR-OWNER-CAP) count retained units, any state.
 At a cap the least recently used finished unit is evicted silently; with none,
 UNIT-LIMIT-REACHED is signalled (ERROR) with restarts EVICT-LRU (offered when a
@@ -589,6 +603,7 @@ SCOPE-CLOSED. Shut-down supervisor → SUPERVISOR-CLOSED."
                                               "give :command or :function, not both"
                                               "give :command or :function (or :executor)")))))
            (owner (%resolve-owner sup owner)))
+      (%check-stdio sup kind command exec stdio restart)
       ;; Caps: evict silently, or ask (EVICT-LRU / ABORT).
       (loop
         (multiple-value-bind (verdict limit victim cap-owner evicted)
@@ -623,7 +638,11 @@ SCOPE-CLOSED. Shut-down supervisor → SUPERVISOR-CLOSED."
                                          :owner owner :labels labels :command command
                                          :function function :cwd cwd :env env
                                          :confinement confinement
-                                         :restart-policy (or restart (kind-default-restart kind))
+                                         :stdio stdio
+                                         :restart-policy (or restart
+                                                             (if (eq stdio :channel)
+                                                                 :never
+                                                                 (kind-default-restart kind)))
                                          :max-restarts (or max-restarts +default-max-restarts+)
                                          :backoff (or backoff +default-backoff+)
                                          :interacting interacting
@@ -680,6 +699,25 @@ SCOPE-CLOSED. Shut-down supervisor → SUPERVISOR-CLOSED."
                   (%spawn-waiter unit gen handle))
                 unit))))))))
 
+(defun %check-stdio (sup kind command exec stdio restart)
+  "START-UNIT's :STDIO checks (see there): a refusal → UNIT-START-ERROR."
+  (flet ((refuse (message)
+           (error 'unit-start-error :supervisor sup :kind kind :command command
+                                    :message message)))
+    (unless (member stdio +unit-stdio-modes+)
+      (refuse (format nil ":stdio ~S is not one of ~S" stdio +unit-stdio-modes+)))
+    (when (eq stdio :channel)
+      (unless (executor-supports-p exec :channel)
+        (refuse (format nil "~(~A~) cannot run a :stdio :channel unit" (type-of exec))))
+      (when (eq restart :on-failure)
+        (refuse "a :stdio :channel unit cannot restart (:restart :never; start a new unit)")))))
+
+(defun %refuse-channel (unit operation)
+  "CHANNEL-UNIT-ERROR for OPERATION (a string) on the channel UNIT."
+  (error 'channel-unit-error :supervisor (unit-supervisor unit) :unit unit
+                             :message (format nil "~A: a channel unit's stdin and stdout belong to the caller~:[~;; start a new unit instead~]"
+                                              operation (string= operation "restart-unit"))))
+
 (defun stop-unit (unit &key grace force-grace)
   "Stop UNIT and wait for it. → its final state (:KILLED; a unit already finished
 keeps its state). Graceful stop (UNIT-STOP-REQUESTED-P becomes T), wait GRACE
@@ -726,8 +764,9 @@ all, one GRACE, STOP-TIMEOUT per unit still running, force, one FORCE-GRACE.
 (defun send-unit-input (unit text)
   "Write TEXT to UNIT's stdin and flush. Finished → UNIT-NOT-RUNNING; the executor
 cannot → EXECUTOR-UNSUPPORTED; stdin closed by CLOSE-UNIT-INPUT on this run →
-UNIT-INPUT-CLOSED. → T."
+UNIT-INPUT-CLOSED; a channel unit → CHANNEL-UNIT-ERROR. → T."
   (check-type text string)
+  (when (unit-channel-p unit) (%refuse-channel unit "send-unit-input"))
   (let* ((sup (unit-supervisor unit))
          (handle (%with-lock (sup)
                    (%touch sup unit)

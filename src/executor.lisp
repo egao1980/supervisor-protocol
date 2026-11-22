@@ -99,6 +99,15 @@ file. → T when this call closed it, NIL when it was already closed. Not suppor
                 (stream-error () (close stdin :abort t))))
             t)))))
 
+(defgeneric executor-channel-streams (executor unit handle)
+  (:documentation "0.5.0: a channel unit's protocol streams. → (values input output):
+INPUT reads the child's stdout, OUTPUT writes its stdin; character streams, UTF-8
+(invalid input bytes become U+FFFD on SBCL). Not supported → EXECUTOR-UNSUPPORTED
+(the default method).")
+  (:method ((executor executor) unit handle)
+    (declare (ignore unit handle))
+    (error 'executor-unsupported :executor executor :operation :channel)))
+
 (defgeneric executor-release (executor unit handle)
   (:documentation "After the end: kill what is left of the tree, close the pipes, join the
 pump threads, close nothing that belongs to the sink. → NIL.")
@@ -107,11 +116,12 @@ pump threads, close nothing that belongs to the sink. → NIL.")
 (defgeneric executor-supports-p (executor capability)
   (:documentation "Capabilities: :PID (EXECUTOR-PID answers), :TREE (stops reach
 descendants), :INPUT (EXECUTOR-SEND-INPUT works), :GRACEFUL-STOP (a graceful stop
-differs from a forced one). Unknown → NIL.")
+differs from a forced one), :CHANNEL (0.5.0: START-UNIT :STDIO :CHANNEL and
+EXECUTOR-CHANNEL-STREAMS work). Unknown → NIL.")
   (:method ((executor executor) capability) (declare (ignore capability)) nil)
   (:method ((executor process-executor) capability)
     (case capability
-      ((:pid :tree :input) t)
+      ((:pid :tree :input :channel) t)
       (:graceful-stop (not (uiop:os-windows-p)))
       (t nil)))
   (:method ((executor thread-executor) capability)
@@ -195,12 +205,66 @@ line numbers of a program's output depend on its bytes, not on read timing
                    (setf fill 0)))))))))
 
 
+;;; 0.5.0: channel units launch with character pipes (process-protocol has one
+;;; element type per launch), so their stderr pump reads characters and hands
+;;; them on as UTF-8 octets, with the same cut-at-the-last-LF rule as %PUMP.
+
+(defparameter +channel-external-format+
+  #+sbcl (list :utf-8 :replacement (code-char #xFFFD))
+  #-sbcl :utf-8
+  "The external format of a channel unit's pipes: UTF-8; on SBCL invalid input bytes
+become U+FFFD instead of a decoding error (a protocol reader, or the stderr pump,
+keeps going). SBCL reads a few octets ahead after an invalid one, so a line
+ending in an invalid byte is returned once more input (or EOF) arrives.")
+
+(defun %read-char-chunk (stream buf start)
+  "%READ-CHUNK for a character STREAM and a string BUF."
+  (declare (type simple-string buf) (type fixnum start))
+  (let ((c (read-char stream nil :eof))
+        (size (length buf)))
+    (if (eq c :eof)
+        nil
+        (let ((n (1+ start)))
+          (declare (type fixnum n))
+          (setf (char buf start) c)
+          (loop while (and (< n size) (listen stream))
+                do (let ((c2 (read-char stream nil :eof)))
+                     (when (eq c2 :eof) (return))
+                     (setf (char buf n) c2)
+                     (incf n)))
+          (values n (and (= n size) (listen stream) t))))))
+
+(defun %pump-chars (stream sink which &key (chunk +pump-chunk+))
+  "%PUMP for a character STREAM: each piece reaches SINK-WRITE-OCTETS as UTF-8."
+  (let ((buf (make-string chunk))
+        (fill 0))
+    (declare (type fixnum fill))
+    (flet ((hand-on (end)
+             (handler-case (progn (sink-write-octets sink which (%utf8-encode (subseq buf 0 end))) t)
+               (error () nil))))
+      (loop
+        (multiple-value-bind (end more-p)
+            (handler-case (%read-char-chunk stream buf fill) (error () nil))
+          (unless end
+            (when (plusp fill) (hand-on fill))
+            (return))
+          (let ((lf (and more-p (position #\Newline buf :end end :from-end t))))
+            (cond (lf
+                   (unless (hand-on (1+ lf)) (return))
+                   (replace buf buf :start2 (1+ lf) :end2 end)
+                   (setf fill (- end (1+ lf))))
+                  (t
+                   (unless (hand-on end) (return))
+                   (setf fill 0)))))))))
+
 (defun %start-pump (handle stream sink which unit)
   (with-slots (lock cv pumps-left pumps) handle
     (bt2:with-lock-held (lock) (incf pumps-left))
     (push (bt2:make-thread
            (lambda ()
-             (unwind-protect (%pump stream sink which)
+             (unwind-protect (if (unit-channel-p unit)
+                                 (%pump-chars stream sink which)
+                                 (%pump stream sink which))
                (bt2:with-lock-held (lock)
                  (decf pumps-left)
                  (bt2:condition-broadcast cv))))
@@ -209,25 +273,31 @@ line numbers of a program's output depend on its bytes, not on read timing
 
 (defun %launch-process (executor unit argv &rest keys)
   "PP:LAUNCH of ARGV as the process executor launches: :PROCESS-GROUP T, three octet
-pipes, then KEYS, then :BACKEND when EXECUTOR has one. → the process. A launch error →
-UNIT-START-ERROR (command: UNIT-COMMAND) with it as cause."
+pipes (a channel unit: character pipes, +CHANNEL-EXTERNAL-FORMAT+), then KEYS, then
+:BACKEND when EXECUTOR has one. → the process. A launch error → UNIT-START-ERROR
+\(command: UNIT-COMMAND) with it as cause."
   (let ((backend (process-executor-backend executor)))
     (handler-case
         (apply #'pp:launch argv
                :process-group t
                :input :stream :output :stream :error-output :stream
-               :element-type :octets
-               (append keys (and backend (list :backend backend))))
+               (append (if (unit-channel-p unit)
+                           (list :element-type 'character
+                                 :external-format +channel-external-format+)
+                           (list :element-type :octets))
+                       keys (and backend (list :backend backend))))
       (error (e)
         (error 'unit-start-error :supervisor (unit-supervisor unit)
                                  :kind (unit-kind unit) :command (unit-command unit) :cause e)))))
 
 (defun %start-process-handle (unit process &optional (class 'process-unit-handle) &rest initargs)
   "A handle of CLASS (a PROCESS-UNIT-HANDLE, with INITARGS) on PROCESS, its stdout and
-stderr pumped into UNIT-OUTPUT-SINK. → the handle."
+stderr pumped into UNIT-OUTPUT-SINK (a channel unit: stderr only; its stdout is the
+caller's). → the handle."
   (let ((handle (apply #'make-instance class :process process :pid (pp:pid process) initargs))
         (sink (unit-output-sink unit)))
-    (when (pp:stdout process) (%start-pump handle (pp:stdout process) sink :stdout unit))
+    (when (and (pp:stdout process) (not (unit-channel-p unit)))
+      (%start-pump handle (pp:stdout process) sink :stdout unit))
     (when (pp:stderr process) (%start-pump handle (pp:stderr process) sink :stderr unit))
     handle))
 
@@ -294,8 +364,37 @@ stderr pumped into UNIT-OUTPUT-SINK. → the handle."
 (defparameter +pump-join-timeout+ 3
   "Seconds EXECUTOR-RELEASE waits for the pumps to reach EOF after the tree kill.")
 
+(defparameter +channel-close-wait+ 1
+  "Seconds EXECUTOR-RELEASE waits for a channel unit's stdin and stdout to close.")
+
+(defun %close-bounded (streams)
+  "Close STREAMS (:ABORT T) on a helper thread; wait +CHANNEL-CLOSE-WAIT+ seconds at
+most for it. → T when every close returned in time."
+  (when streams
+    (let* ((lock (bt2:make-lock :name "channel close"))
+           (cv (bt2:make-condition-variable :name "channel close"))
+           (done nil))
+      (bt2:make-thread
+       (lambda ()
+         (dolist (s streams) (ignore-errors (close s :abort t)))
+         (bt2:with-lock-held (lock)
+           (setf done t)
+           (bt2:condition-broadcast cv)))
+       :name "supervisor channel close")
+      (let ((deadline (+ (%now) +channel-close-wait+)))
+        (bt2:with-lock-held (lock)
+          (loop until (or done (>= (%now) deadline))
+                do (bt2:condition-wait cv lock :timeout (max 0.01 (- deadline (%now)))))
+          done)))))
+
+(defmethod executor-channel-streams ((executor process-executor) unit handle)
+  (unless (unit-channel-p unit)
+    (error 'channel-unit-error :supervisor (unit-supervisor unit) :unit unit
+                               :message "not a channel unit (started without :stdio :channel)"))
+  (let ((process (%ph-process handle)))
+    (values (pp:stdout process) (pp:stdin process))))
+
 (defmethod executor-release ((executor process-executor) unit handle)
-  (declare (ignore unit))
   (let ((process (%ph-process handle)))
     (with-slots (lock cv pumps-left pumps released) handle
       (unless (bt2:with-lock-held (lock) (shiftf released t))
@@ -306,8 +405,15 @@ stderr pumped into UNIT-OUTPUT-SINK. → the handle."
           (bt2:with-lock-held (lock)
             (loop while (and (plusp pumps-left) (< (%now) deadline))
                   do (bt2:condition-wait cv lock :timeout (max 0.01 (- deadline (%now)))))))
-        (dolist (s (list (pp:stdin process) (pp:stdout process) (pp:stderr process)))
-          (when s (ignore-errors (close s :abort t))))
+        (if (unit-channel-p unit)
+            ;; The caller's reader may still sit in a read on stdout: close the
+            ;; channel off this thread (closing a Windows pipe under a pending
+            ;; read blocks), waited for +CHANNEL-CLOSE-WAIT+ seconds at most.
+            (progn
+              (%close-bounded (remove nil (list (pp:stdin process) (pp:stdout process))))
+              (when (pp:stderr process) (ignore-errors (close (pp:stderr process) :abort t))))
+            (dolist (s (list (pp:stdin process) (pp:stdout process) (pp:stderr process)))
+              (when s (ignore-errors (close s :abort t)))))
         (dolist (th pumps)
           (unless (bt2:thread-alive-p th)
             (ignore-errors (bt2:join-thread th)))))))

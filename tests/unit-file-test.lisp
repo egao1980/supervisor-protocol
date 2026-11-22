@@ -11,11 +11,13 @@
         "a namestring without the trailing separator")))
 
 (deftest unit-file-lifecycle
+  ;; The child lives 8 s: the Windows CIM inspector can take seconds, and the
+  ;; "OS's own value" check needs the process still running (2 s flaked on CI).
   (with-temp-dir (dir)
     (with-supervisor (sup :state-directory dir)
       (ok (equal (uiop:ensure-directory-pathname dir)
                  (uiop:ensure-directory-pathname (supervisor-state-directory sup))))
-      (let* ((u (start-unit sup :shell-job :command (exit-argv 0 :delay 2) :cwd dir))
+      (let* ((u (start-unit sup :shell-job :command (exit-argv 0 :delay 8) :cwd dir))
              (path (unit-file-path u)))
         (ok (and path (probe-file path)) "written at launch")
         (ok (equal (unit-file-directory dir) (uiop:pathname-directory-pathname path)))
