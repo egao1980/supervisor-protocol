@@ -7,6 +7,7 @@
   (:export
    ;; constants
    #:+unit-states+
+   #:+unit-stdio-modes+
    #:+live-states+
    #:+final-states+
    #:+event-types+
@@ -79,6 +80,10 @@
    #:with-unit-interaction
    #:restart-unit
    #:close-unit-input
+   ;; 0.5.0: channel units
+   #:unit-stdio
+   #:unit-channel-p
+   #:unit-channel-streams
    #:*current-unit*
    #:unit-id
    #:unit-kind
@@ -141,6 +146,7 @@
    #:executor-send-input
    #:executor-release
    #:executor-close-input
+   #:executor-channel-streams
    #:executor-supports-p
    ;; output
    #:output-sink
@@ -297,6 +303,7 @@
    #:stop-failed
    #:unit-not-running
    #:unit-input-closed
+   #:channel-unit-error
    #:executor-unsupported
    #:executor-unsupported-executor
    #:executor-unsupported-operation

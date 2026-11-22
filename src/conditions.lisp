@@ -81,6 +81,16 @@
   (:report (lambda (c s)
              (format s "Unit ~A: its stdin was closed" (unit-id (unit-error-unit c))))))
 
+(define-condition channel-unit-error (unit-error)
+  ()
+  (:documentation "0.5.0: an operation that does not fit the unit's :STDIO mode:
+SEND-UNIT-INPUT, CLOSE-UNIT-INPUT or RESTART-UNIT on a channel unit (the caller owns
+its stdin and stdout; a new run needs a new unit), or UNIT-CHANNEL-STREAMS on a unit
+that is not one.")
+  (:report (lambda (c s)
+             (format s "Unit ~A: ~A" (unit-id (unit-error-unit c))
+                     (or (supervisor-error-message c) "channel unit mismatch")))))
+
 (define-condition executor-unsupported (supervisor-error)
   ((executor :initarg :executor :reader executor-unsupported-executor)
    (operation :initarg :operation :reader executor-unsupported-operation))

@@ -40,8 +40,10 @@ header starts after an end record; LOG-CLOSED-P and LOG-FOLLOW's ENDED-P look at
 the last end record only).
 → UNIT in :RUNNING. A unit no longer in its supervisor's registry (evicted) →
 SUPERVISOR-ERROR; a shut-down supervisor → SUPERVISOR-CLOSED; a launch failure →
-UNIT-START-ERROR with the unit left :FAILED (and its :STATE event)."
+UNIT-START-ERROR with the unit left :FAILED (and its :STATE event). A channel unit →
+CHANNEL-UNIT-ERROR (0.5.0)."
   (check-type unit unit)
+  (when (unit-channel-p unit) (%refuse-channel unit "restart-unit"))
   (let* ((sup (unit-supervisor unit))
          (exec (unit-executor unit))
          (refusal (%with-lock (sup)
@@ -128,10 +130,35 @@ UNIT-START-ERROR with the unit left :FAILED (and its :STATE event)."
   "Close UNIT's stdin (EXECUTOR-CLOSE-INPUT), so a program reading it sees end of
 file. → T when this call closed it; NIL when it was already closed or the unit is
 finished. Later SEND-UNIT-INPUT on this run → UNIT-INPUT-CLOSED. A restart opens a
-new stdin. Thread units → EXECUTOR-UNSUPPORTED."
+new stdin. Thread units → EXECUTOR-UNSUPPORTED. A channel unit → CHANNEL-UNIT-ERROR
+(0.5.0): its stdin is the caller's, close the stream from UNIT-CHANNEL-STREAMS."
   (check-type unit unit)
+  (when (unit-channel-p unit) (%refuse-channel unit "close-unit-input"))
   (let* ((sup (unit-supervisor unit))
          (handle (%with-lock (sup)
                    (%touch sup unit)
                    (and (unit-live-p unit) (slot-value unit 'handle)))))
     (and handle (executor-close-input (unit-executor unit) unit handle) t)))
+
+;;; 0.5.0: channel units (supervisor-protocol#13).
+
+(defun unit-channel-streams (unit)
+  "The protocol streams of a channel unit (START-UNIT :STDIO :CHANNEL). → (values
+INPUT OUTPUT): INPUT reads the child's stdout, OUTPUT writes its stdin; character
+streams, UTF-8, as MAKE-STDIO-RPC-TRANSPORT :INPUT / :OUTPUT take them. The caller
+owns reading and writing (and may close OUTPUT to send end of file); the supervisor
+owns the process: stop, tree kill, reap, state, exit code, unit file and sweep.
+When the unit has ended the streams are closed by its release (the stdout of a
+child that exited is at end of file first). Touches UNIT. Not a channel unit →
+CHANNEL-UNIT-ERROR."
+  (check-type unit unit)
+  (unless (unit-channel-p unit)
+    (error 'channel-unit-error :supervisor (unit-supervisor unit) :unit unit
+                               :message "not a channel unit (started without :stdio :channel)"))
+  (let* ((sup (unit-supervisor unit))
+         (handle (%with-lock (sup)
+                   (%touch sup unit)
+                   (slot-value unit 'handle))))
+    (unless handle
+      (error 'unit-not-running :supervisor sup :unit unit))
+    (executor-channel-streams (unit-executor unit) unit handle)))

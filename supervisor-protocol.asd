@@ -1,6 +1,6 @@
 (defsystem "supervisor-protocol"
-  :version "0.4.1"
-  :description "Process supervisor for the cl-stack harness: units, scopes, caps, restarts, events, orphan sweep, rotated capped unit logs, manual restart and stdin close, confined units through compute-protocol"
+  :version "0.5.0"
+  :description "Process supervisor for the cl-stack harness: units, scopes, caps, restarts, events, orphan sweep, rotated capped unit logs, manual restart and stdin close, confined units through compute-protocol, channel units (stdin and stdout to the caller, stderr to the log)"
   :author "egao1980"
   :license "MIT"
   :depends-on ((:version "process-protocol" "0.4.1")
@@ -30,11 +30,11 @@
   :in-order-to ((test-op (test-op "supervisor-protocol/tests"))))
 
 (defsystem "supervisor-protocol/search"
-  :version "0.4.1"
+  :version "0.5.0"
   :description "H8c: incremental BM25 index and structured hits (errors, warnings, stack traces, test failures, exits) over supervisor unit logs"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "supervisor-protocol" "0.4.1")
+  :depends-on ((:version "supervisor-protocol" "0.5.0")
                (:version "cl-stack-pathlib" "0.9.0")
                (:version "encoding-protocol" "0.2.0")
                "bordeaux-threads"
@@ -50,6 +50,7 @@
 
 (defsystem "supervisor-protocol/tests"
   :depends-on ("supervisor-protocol" "supervisor-protocol/search" "process-protocol"
+               (:version "rpc-backend-stdio" "0.3.2") "rpc-protocol"
                "compute-protocol" "bordeaux-threads" "rove")
   :pathname "tests"
   :serial t
@@ -92,7 +93,9 @@
                (:file "search-golden-test")
                (:file "search-unit-test")
                ;; R4d-0
-               (:file "confine-test"))
+               (:file "confine-test")
+               ;; 0.5.0
+               (:file "channel-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
